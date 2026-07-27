@@ -1,0 +1,32 @@
+[package]
+name = "stellarconduit-sync-engine-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Detached from the parent crate's build so `cargo build`/`cargo test` at the
+# repo root never tries to compile the fuzz targets (they require the nightly
+# toolchain and libfuzzer-sys). Only `cargo fuzz`, invoked from this
+# directory, builds this crate.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+rmp-serde = "1.1"
+stellarconduit-core = { git = "https://github.com/StellarConduit/stellarconduit-core.git", rev = "da4c057" }
+
+# Same workaround as the parent crate's Cargo.toml: stellarconduit-core's
+# ffi.rs calls SigningKey::generate(), which only compiles with rand_core
+# enabled on ed25519-dalek. This crate is its own detached workspace, so it
+# doesn't inherit the parent's feature unification and needs the same fix.
+ed25519-dalek = { version = "2.1.1", features = ["rand_core"] }
+
+[[bin]]
+name = "deserialize_envelope"
+path = "fuzz_targets/deserialize_envelope.rs"
+test = false
+doc = false
+bench = false

@@ -1,5 +1,34 @@
 use thiserror::Error;
 
+/// Classifies a [`SyncEngineError`] into one of three recovery buckets.
+///
+/// This is the single source of truth for retry/recovery policy across the
+/// crate. Every future issue that needs to decide "is this worth retrying?"
+/// (#008, #016, #017, #018) should call [`SyncEngineError::classify()`]
+/// rather than duplicating ad-hoc judgements.
+///
+/// # Variants
+///
+/// - **`Permanent`** — the error is a caller-code bug or an irrecoverable
+///   logical invariant violation. No amount of retrying will help; the caller
+///   must fix the root cause (e.g. pass a valid sequence number, supply an
+///   authorized signer).
+///
+/// - **`Transient`** — the error is likely caused by environmental conditions
+///   (disk contention, lock conflicts, I/O races) that may resolve on their
+///   own. A short retry with exponential back-off is appropriate.
+///
+/// - **`RequiresEscalation`** — neither retry nor give-up is the right move.
+///   The error signals a situation that requires human intervention or an
+///   off-chain → on-chain escalation path (see issue #002's dispute-resolver
+///   contract). The embedding wallet should surface this to the user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorClass {
+    Permanent,
+    Transient,
+    RequiresEscalation,
+}
+
 #[derive(Error, Debug)]
 pub enum SyncEngineError {
     #[error("no sequence number reserved for account {0}")]
@@ -75,4 +104,233 @@ pub enum SyncEngineError {
 
     #[error("deserialization error: {0}")]
     DeserializationError(#[from] rmp_serde::decode::Error),
+}
+
+impl SyncEngineError {
+    /// Classify this error into a recovery bucket.
+    ///
+    /// The match is intentionally exhaustive with **no wildcard arm**. This
+    /// means that adding a new [`SyncEngineError`] variant without also
+    /// updating this function is a **compile error**, not a silent gap.
+    /// `#[deny(unreachable_patterns)]` is also applied to make that guarantee
+    /// even harder to accidentally break.
+    ///
+    /// # Classification rationale
+    ///
+    /// | Variant | Class | Why |
+    /// |---------|-------|-----|
+    /// | `NoSequenceReserved` | Permanent | The caller never called `seed()`/`reserve()` before attempting to build an envelope. This is a programming error; retrying the same call without fixing the caller will always fail. |
+    /// | `SequenceOutOfOrder` | Permanent | The caller passed a sequence number that regresses or equals `last_reserved`. This is a logical invariant violation in caller code; the sequence must be corrected before any retry makes sense. |
+    /// | `InvalidEnvelope` | Permanent | Envelope validation failed because the payload itself is malformed. The same invalid bytes will fail validation on every attempt. |
+    /// | `EnvelopeNotFound` | Permanent | A lookup by `message_id` returned nothing. The envelope was never enqueued, or has already been removed. Retrying the same lookup against the same DB will not materialise it. |
+    /// | `InvalidStateTransition` | Permanent | A state-machine transition was attempted that is not in the legal transition graph. Retrying the same transition will never become legal; the caller has a logic bug. |
+    /// | `UnresolvedConflict` | RequiresEscalation | Two envelopes compete for the same account/sequence slot and could not be resolved off-chain. Neither retrying nor giving up is correct — the dispute must be escalated to the on-chain `dispute-resolver` contract (see issue #002). |
+    /// | `EmergencyQueueLimitExceeded` | RequiresEscalation | The spending guard has tripped. A simple retry without user re-confirmation would be a security bypass. The embedding wallet must surface this to the user (biometric re-auth or explicit override) before queuing is retried. |
+    /// | `UnknownMultisigSigner` | Permanent | The presented signing key is not in the account's authorised signer set. No retry will change the signer registry without an explicit key-management operation. |
+    /// | `MultisigThresholdNotMet` | Permanent | The accumulated signer weight is below the required threshold. In this context the error means promotion was attempted prematurely; more signatures are needed, which is a caller flow issue, not a transient I/O problem. |
+    /// | `ConnectionError` | Transient | `tokio_rusqlite` errors typically arise from thread-pool contention, busy-timeout, or a momentary lock on the WAL file. These conditions usually resolve within milliseconds and are appropriate to retry with back-off. |
+    /// | `SqliteError` | Transient | Raw `rusqlite` errors (e.g. `SQLITE_BUSY`, `SQLITE_LOCKED`) are similarly caused by disk/locking contention and are generally safe to retry. Callers that need to distinguish truly fatal SQLite errors (e.g. corruption) may inspect the inner `rusqlite::Error` further, but the default classification is Transient. |
+    /// | `SerializationError` | Permanent | A value could not be encoded to MessagePack. This reflects a type-system mismatch or an unencodable value; retrying the same data will produce the same error. |
+    /// | `DeserializationError` | Permanent | Stored bytes could not be decoded. The bytes are corrupted or were written by an incompatible schema version. Retrying the same read will not repair the data. |
+    #[deny(unreachable_patterns)]
+    pub fn classify(&self) -> ErrorClass {
+        match self {
+            // ── Permanent: caller-code bugs and irrecoverable logical failures ──
+            SyncEngineError::NoSequenceReserved(_) => ErrorClass::Permanent,
+            SyncEngineError::SequenceOutOfOrder { .. } => ErrorClass::Permanent,
+            SyncEngineError::InvalidEnvelope(_) => ErrorClass::Permanent,
+            SyncEngineError::EnvelopeNotFound(_) => ErrorClass::Permanent,
+            SyncEngineError::InvalidStateTransition { .. } => ErrorClass::Permanent,
+            SyncEngineError::UnknownMultisigSigner { .. } => ErrorClass::Permanent,
+            SyncEngineError::MultisigThresholdNotMet { .. } => ErrorClass::Permanent,
+            SyncEngineError::SerializationError(_) => ErrorClass::Permanent,
+            SyncEngineError::DeserializationError(_) => ErrorClass::Permanent,
+
+            // ── RequiresEscalation: needs human/on-chain intervention ──
+            SyncEngineError::UnresolvedConflict(_) => ErrorClass::RequiresEscalation,
+            SyncEngineError::EmergencyQueueLimitExceeded { .. } => ErrorClass::RequiresEscalation,
+
+            // ── Transient: environmental failures worth retrying with back-off ──
+            SyncEngineError::ConnectionError(_) => ErrorClass::Transient,
+            SyncEngineError::SqliteError(_) => ErrorClass::Transient,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Helpers to construct every variant ──────────────────────────────────
+
+    fn all_variants() -> Vec<SyncEngineError> {
+        vec![
+            SyncEngineError::NoSequenceReserved("GTEST".into()),
+            SyncEngineError::SequenceOutOfOrder {
+                account: "GTEST".into(),
+                requested: 5,
+                last_reserved: 10,
+            },
+            SyncEngineError::InvalidEnvelope("bad payload".into()),
+            SyncEngineError::EnvelopeNotFound("deadbeef".into()),
+            SyncEngineError::InvalidStateTransition {
+                from: "queued".into(),
+                to: "settled".into(),
+            },
+            SyncEngineError::UnresolvedConflict("slot 42".into()),
+            SyncEngineError::EmergencyQueueLimitExceeded {
+                current: 3,
+                max: 3,
+                window_secs: 60,
+            },
+            SyncEngineError::UnknownMultisigSigner {
+                account: "GTEST".into(),
+            },
+            SyncEngineError::MultisigThresholdNotMet {
+                account: "GTEST".into(),
+                accumulated_weight: 1,
+                required_threshold: 2,
+            },
+            SyncEngineError::ConnectionError(tokio_rusqlite::Error::Rusqlite(
+                rusqlite::Error::InvalidQuery,
+            )),
+            SyncEngineError::SqliteError(rusqlite::Error::InvalidQuery),
+            SyncEngineError::SerializationError(rmp_serde::encode::Error::UnknownLength),
+            SyncEngineError::DeserializationError(rmp_serde::decode::Error::Syntax("test".into())),
+        ]
+    }
+
+    /// Living checklist: every variant must be constructible here and must
+    /// return one of the three defined classes without panicking.
+    /// A new variant added to `SyncEngineError` without a corresponding entry
+    /// in `all_variants()` is a sign the classification audit is incomplete.
+    #[test]
+    fn test_every_variant_has_a_classification() {
+        let valid_classes = [
+            ErrorClass::Permanent,
+            ErrorClass::Transient,
+            ErrorClass::RequiresEscalation,
+        ];
+        for variant in all_variants() {
+            let class = variant.classify();
+            assert!(
+                valid_classes.contains(&class),
+                "classify() returned an unexpected value for {:?}",
+                variant
+            );
+        }
+    }
+
+    // ── Per-class tests ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_sequence_errors_are_permanent() {
+        assert_eq!(
+            SyncEngineError::NoSequenceReserved("GTEST".into()).classify(),
+            ErrorClass::Permanent
+        );
+        assert_eq!(
+            SyncEngineError::SequenceOutOfOrder {
+                account: "GTEST".into(),
+                requested: 1,
+                last_reserved: 5,
+            }
+            .classify(),
+            ErrorClass::Permanent
+        );
+    }
+
+    #[test]
+    fn test_storage_errors_are_transient() {
+        assert_eq!(
+            SyncEngineError::ConnectionError(tokio_rusqlite::Error::Rusqlite(
+                rusqlite::Error::InvalidQuery
+            ))
+            .classify(),
+            ErrorClass::Transient
+        );
+        assert_eq!(
+            SyncEngineError::SqliteError(rusqlite::Error::InvalidQuery).classify(),
+            ErrorClass::Transient
+        );
+    }
+
+    #[test]
+    fn test_unresolved_conflict_requires_escalation() {
+        assert_eq!(
+            SyncEngineError::UnresolvedConflict("slot conflict".into()).classify(),
+            ErrorClass::RequiresEscalation
+        );
+    }
+
+    #[test]
+    fn test_emergency_queue_limit_requires_escalation() {
+        assert_eq!(
+            SyncEngineError::EmergencyQueueLimitExceeded {
+                current: 3,
+                max: 3,
+                window_secs: 60,
+            }
+            .classify(),
+            ErrorClass::RequiresEscalation
+        );
+    }
+
+    #[test]
+    fn test_invalid_envelope_is_permanent() {
+        assert_eq!(
+            SyncEngineError::InvalidEnvelope("malformed".into()).classify(),
+            ErrorClass::Permanent
+        );
+    }
+
+    #[test]
+    fn test_envelope_not_found_is_permanent() {
+        assert_eq!(
+            SyncEngineError::EnvelopeNotFound("deadbeef".into()).classify(),
+            ErrorClass::Permanent
+        );
+    }
+
+    #[test]
+    fn test_invalid_state_transition_is_permanent() {
+        assert_eq!(
+            SyncEngineError::InvalidStateTransition {
+                from: "queued".into(),
+                to: "settled".into(),
+            }
+            .classify(),
+            ErrorClass::Permanent
+        );
+    }
+
+    #[test]
+    fn test_multisig_errors_are_permanent() {
+        assert_eq!(
+            SyncEngineError::UnknownMultisigSigner {
+                account: "GTEST".into()
+            }
+            .classify(),
+            ErrorClass::Permanent
+        );
+        assert_eq!(
+            SyncEngineError::MultisigThresholdNotMet {
+                account: "GTEST".into(),
+                accumulated_weight: 1,
+                required_threshold: 2,
+            }
+            .classify(),
+            ErrorClass::Permanent
+        );
+    }
+
+    #[test]
+    fn test_serde_errors_are_permanent() {
+        let enc_err = SyncEngineError::SerializationError(rmp_serde::encode::Error::UnknownLength);
+        assert_eq!(enc_err.classify(), ErrorClass::Permanent);
+
+        let dec_err =
+            SyncEngineError::DeserializationError(rmp_serde::decode::Error::Syntax("test".into()));
+        assert_eq!(dec_err.classify(), ErrorClass::Permanent);
+    }
 }

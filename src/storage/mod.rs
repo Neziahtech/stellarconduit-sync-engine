@@ -1,3 +1,3 @@
 pub mod db;
 
-pub use db::{QueuedEnvelopeRecord, SyncEngineDb};
+pub use db::{HistoryEntry, QueuedEnvelopeRecord, SyncEngineDb};

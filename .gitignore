@@ -2,3 +2,8 @@
 **/*.rs.bk
 Cargo.lock
 docs/issues/
+
+# cargo-fuzz build output and crash artifacts (the seed corpus under
+# fuzz/corpus/ is intentionally still tracked)
+/fuzz/target
+/fuzz/artifacts

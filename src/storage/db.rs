@@ -27,6 +27,14 @@ pub struct QueuedEnvelopeRecord {
     pub enqueued_at: u64,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct HistoryEntry {
+    pub message_id: [u8; 32],
+    pub from_status: String,
+    pub to_status: String,
+    pub timestamp: u64,
+}
+
 impl SyncEngineDb {
     /// Initialize the embedded SQLite database, creating tables if needed.
     /// Pass `":memory:"` for an ephemeral, test-only database.
@@ -67,6 +75,14 @@ impl SyncEngineDb {
                     envelope_b      BLOB NOT NULL,
                     detected_at     INTEGER NOT NULL,
                     resolved        INTEGER NOT NULL DEFAULT 0
+                );
+
+                CREATE TABLE IF NOT EXISTS settlement_history (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    message_id  BLOB NOT NULL,
+                    from_status TEXT NOT NULL,
+                    to_status   TEXT NOT NULL,
+                    timestamp   INTEGER NOT NULL
                 );",
             )?;
             Ok(())
@@ -224,14 +240,29 @@ impl SyncEngineDb {
         updated_at: u64,
     ) -> Result<(), SyncEngineError> {
         let id = message_id.to_vec();
-        let status = status.as_str().to_string();
+        let status_str = status.as_str().to_string();
         self.conn
             .call(move |conn| {
+                let from_status: String = conn
+                    .query_row(
+                        "SELECT status FROM settlement_status WHERE message_id = ?1",
+                        rusqlite::params![id],
+                        |row| row.get(0),
+                    )
+                    .unwrap_or_default();
+
                 conn.execute(
                     "INSERT OR REPLACE INTO settlement_status (message_id, status, updated_at)
                      VALUES (?1, ?2, ?3)",
-                    rusqlite::params![id, status, updated_at as i64],
+                    rusqlite::params![id, status_str, updated_at as i64],
                 )?;
+
+                conn.execute(
+                    "INSERT INTO settlement_history (message_id, from_status, to_status, timestamp)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![id, from_status, status_str, updated_at as i64],
+                )?;
+
                 Ok(())
             })
             .await?;
@@ -258,6 +289,40 @@ impl SyncEngineDb {
             .await?;
 
         status.map(|s| s.parse()).transpose()
+    }
+
+    pub async fn history_for(
+        &self,
+        message_id: [u8; 32],
+    ) -> Result<Vec<HistoryEntry>, SyncEngineError> {
+        let id = message_id.to_vec();
+        let rows = self
+            .conn
+            .call(move |conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT message_id, from_status, to_status, timestamp
+                     FROM settlement_history
+                     WHERE message_id = ?1
+                     ORDER BY id",
+                )?;
+                let rows = stmt
+                    .query_map(rusqlite::params![id], |row| {
+                        let message_id: Vec<u8> = row.get(0)?;
+                        let from_status: String = row.get(1)?;
+                        let to_status: String = row.get(2)?;
+                        let timestamp: i64 = row.get(3)?;
+                        Ok(HistoryEntry {
+                            message_id: message_id.try_into().unwrap_or([0u8; 32]),
+                            from_status,
+                            to_status,
+                            timestamp: timestamp as u64,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, rusqlite::Error>>()?;
+                Ok(rows)
+            })
+            .await?;
+        Ok(rows)
     }
 
     pub async fn save_sequence_reservation(
@@ -355,6 +420,45 @@ impl SyncEngineDb {
                 },
             )
             .collect())
+    }
+
+    pub async fn sweep_stale_envelopes(
+        &self,
+        max_age_secs: u64,
+        now: u64,
+    ) -> Result<Vec<[u8; 32]>, SyncEngineError> {
+        let cutoff = now.saturating_sub(max_age_secs) as i64;
+        let stale_id_bytes: Vec<Vec<u8>> = self
+            .conn
+            .call(move |conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT q.message_id
+                     FROM queued_envelopes q
+                     JOIN settlement_status s ON s.message_id = q.message_id
+                     WHERE q.enqueued_at < ?1
+                       AND s.status IN ('queued', 'propagating')",
+                )?;
+                let rows = stmt
+                    .query_map(rusqlite::params![cutoff], |row| {
+                        let message_id: Vec<u8> = row.get(0)?;
+                        Ok(message_id)
+                    })?
+                    .collect::<Result<Vec<_>, rusqlite::Error>>()?;
+                Ok(rows)
+            })
+            .await?;
+
+        let stale_ids: Vec<[u8; 32]> = stale_id_bytes
+            .into_iter()
+            .filter_map(|v| v.try_into().ok())
+            .collect();
+
+        for &mid in &stale_ids {
+            self.set_settlement_status(mid, SettlementStatus::Failed, now)
+                .await?;
+        }
+
+        Ok(stale_ids)
     }
 }
 
@@ -454,5 +558,154 @@ mod tests {
         let unresolved = db.list_unresolved_conflicts().await.unwrap();
         assert_eq!(unresolved.len(), 1);
         assert_eq!(unresolved[0], conflict);
+    }
+
+    // ── Issue 2: settlement_history tests ──
+
+    #[tokio::test]
+    async fn test_successful_transitions_are_recorded_in_order() {
+        let db = SyncEngineDb::init(":memory:").await.unwrap();
+        let id = [1u8; 32];
+
+        db.set_settlement_status(id, SettlementStatus::Queued, 1000)
+            .await
+            .unwrap();
+        db.set_settlement_status(id, SettlementStatus::Propagating, 1001)
+            .await
+            .unwrap();
+        db.set_settlement_status(id, SettlementStatus::Settled, 1002)
+            .await
+            .unwrap();
+
+        let history = db.history_for(id).await.unwrap();
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[0].from_status, "");
+        assert_eq!(history[0].to_status, "queued");
+        assert_eq!(history[0].timestamp, 1000);
+        assert_eq!(history[1].from_status, "queued");
+        assert_eq!(history[1].to_status, "propagating");
+        assert_eq!(history[1].timestamp, 1001);
+        assert_eq!(history[2].from_status, "propagating");
+        assert_eq!(history[2].to_status, "settled");
+        assert_eq!(history[2].timestamp, 1002);
+    }
+
+    #[tokio::test]
+    async fn test_history_for_unknown_envelope_is_empty() {
+        let db = SyncEngineDb::init(":memory:").await.unwrap();
+        let history = db.history_for([99u8; 32]).await.unwrap();
+        assert!(history.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_full_lifecycle_produces_complete_history() {
+        let db = SyncEngineDb::init(":memory:").await.unwrap();
+        let id = [2u8; 32];
+
+        db.set_settlement_status(id, SettlementStatus::Queued, 1000)
+            .await
+            .unwrap();
+        db.set_settlement_status(id, SettlementStatus::Propagating, 1001)
+            .await
+            .unwrap();
+        db.set_settlement_status(id, SettlementStatus::Disputed, 1002)
+            .await
+            .unwrap();
+        db.set_settlement_status(id, SettlementStatus::Settled, 1003)
+            .await
+            .unwrap();
+
+        let history = db.history_for(id).await.unwrap();
+        assert_eq!(history.len(), 4);
+        assert_eq!(history[0].to_status, "queued");
+        assert_eq!(history[1].to_status, "propagating");
+        assert_eq!(history[2].to_status, "disputed");
+        assert_eq!(history[3].to_status, "settled");
+    }
+
+    // ── Issue 3: staleness sweep tests ──
+
+    #[tokio::test]
+    async fn test_sweep_identifies_stale_queued_envelopes() {
+        let db = SyncEngineDb::init(":memory:").await.unwrap();
+        let stale_id = [1u8; 32];
+        let fresh_id = [2u8; 32];
+
+        db.enqueue_envelope(&mock_envelope(1), "GABC", 101, TxPriority::Normal, 100)
+            .await
+            .unwrap();
+        db.set_settlement_status(stale_id, SettlementStatus::Queued, 100)
+            .await
+            .unwrap();
+
+        db.enqueue_envelope(&mock_envelope(2), "GABC", 102, TxPriority::Normal, 900)
+            .await
+            .unwrap();
+        db.set_settlement_status(fresh_id, SettlementStatus::Queued, 900)
+            .await
+            .unwrap();
+
+        // now=1000, max_age=500 => cutoff=500; stale (enqueued_at=100) is past, fresh (900) is not
+        let stale = db.sweep_stale_envelopes(500, 1000).await.unwrap();
+        assert_eq!(stale, vec![stale_id]);
+    }
+
+    #[tokio::test]
+    async fn test_sweep_ignores_fresh_envelopes() {
+        let db = SyncEngineDb::init(":memory:").await.unwrap();
+        let id = [1u8; 32];
+
+        db.enqueue_envelope(&mock_envelope(1), "GABC", 101, TxPriority::Normal, 800)
+            .await
+            .unwrap();
+        db.set_settlement_status(id, SettlementStatus::Queued, 800)
+            .await
+            .unwrap();
+
+        let stale = db.sweep_stale_envelopes(500, 1000).await.unwrap();
+        assert!(stale.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_sweep_ignores_already_terminal_envelopes() {
+        let db = SyncEngineDb::init(":memory:").await.unwrap();
+        let settled_id = [1u8; 32];
+        let failed_id = [2u8; 32];
+
+        db.enqueue_envelope(&mock_envelope(1), "GABC", 101, TxPriority::Normal, 100)
+            .await
+            .unwrap();
+        db.set_settlement_status(settled_id, SettlementStatus::Settled, 100)
+            .await
+            .unwrap();
+
+        db.enqueue_envelope(&mock_envelope(2), "GABC", 102, TxPriority::Normal, 100)
+            .await
+            .unwrap();
+        db.set_settlement_status(failed_id, SettlementStatus::Failed, 100)
+            .await
+            .unwrap();
+
+        let stale = db.sweep_stale_envelopes(500, 1000).await.unwrap();
+        assert!(stale.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_sweep_is_idempotent() {
+        let db = SyncEngineDb::init(":memory:").await.unwrap();
+        let id = [1u8; 32];
+
+        db.enqueue_envelope(&mock_envelope(1), "GABC", 101, TxPriority::Normal, 100)
+            .await
+            .unwrap();
+        db.set_settlement_status(id, SettlementStatus::Queued, 100)
+            .await
+            .unwrap();
+
+        let first = db.sweep_stale_envelopes(500, 1000).await.unwrap();
+        assert!(!first.is_empty());
+
+        let second = db.sweep_stale_envelopes(500, 1000).await.unwrap();
+        assert!(second.is_empty());
     }
 }

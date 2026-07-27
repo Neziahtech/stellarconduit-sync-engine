@@ -183,6 +183,21 @@ cargo build
 cargo test
 ```
 
+### 4. Run the Mock Relay Example
+```bash
+# Basic demo — queue 3 payments and watch them settle
+cargo run --example mock_relay
+
+# Customise payment count and relay latency
+cargo run --example mock_relay -- --payments 5 --relay-delay-ms 200
+
+# Inject a double-spend conflict scenario
+cargo run --example mock_relay -- --inject-conflict
+
+# Combine flags
+cargo run --example mock_relay -- --payments 2 --relay-delay-ms 1000 --inject-conflict
+```
+
 ---
 
 ## Development
@@ -220,6 +235,34 @@ cargo test --lib
 
 # Integration tests only
 cargo test --test '*'
+```
+
+**Property-based tests** use [`proptest`](https://docs.rs/proptest) (a dev-dependency) to check invariants across a much larger input space than example-based tests reach, for the two most safety-critical pieces of this crate:
+
+- `conflict::detector::detect_conflicts` — for randomly generated batches of `QueuedSlot`s, every reported `Conflict` genuinely shares an (account, sequence) pair with differing message IDs, and no colliding pair is missed. This is cross-checked against a naive O(n²) reference implementation written only for the test (`proptest_detect_conflicts_matches_naive_reference` in `src/conflict/detector.rs`), run over several thousand generated cases.
+- `settlement::tracker::SettlementStatus::can_transition_to` — checked exhaustively (not randomly; the state space is small enough that full coverage is stronger) against a hand-written reachability graph, across all 25 `(from, to)` pairs over the 5 `SettlementStatus` variants (`test_settlement_transition_matrix_is_exhaustive` in `src/settlement/tracker.rs`).
+
+These run as part of the normal test suite — no separate command is needed.
+
+### Fuzz Testing
+
+A [`cargo-fuzz`](https://github.com/rust-fuzz/cargo-fuzz) target lives in [`fuzz/`](fuzz/) and exercises `rmp_serde::from_slice::<TransactionEnvelope>`, the deserialization path `SyncEngineDb` uses to read queued envelopes back out of SQLite (see `src/storage/db.rs`). Envelope bytes are meant to be ones this crate wrote itself, but corrupted or adversarial input should be rejected with an error, never cause a panic — this matters more once database export/import (for device migration) makes it possible to load a `SyncEngineDb` file from an untrusted source.
+
+The fuzz crate is a separate, detached workspace (`fuzz/Cargo.toml` has its own `[workspace]`), so it does not affect `cargo build`/`cargo test`/`cargo clippy` at the repo root and is not required to run in normal CI.
+
+**Running it locally** (requires the nightly toolchain):
+```bash
+cargo install cargo-fuzz
+rustup install nightly
+
+# Fuzz indefinitely (stop with Ctrl-C); crashing inputs are saved under fuzz/artifacts/
+cargo +nightly fuzz run deserialize_envelope
+```
+
+**CI-friendly bounded smoke run** — fuzzing indefinitely isn't practical for regular CI, but a short bounded run still catches regressions (e.g. a newly-introduced panic on malformed input) cheaply:
+```bash
+# Runs for 60 wall-clock seconds, then exits; non-zero exit code means a crash was found
+cargo +nightly fuzz run deserialize_envelope -- -max_total_time=60
 ```
 
 We target a minimum of **85% test coverage** for this repository given its role in guaranteeing funds are never lost or double-spent.
