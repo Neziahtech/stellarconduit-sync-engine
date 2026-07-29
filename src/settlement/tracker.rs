@@ -39,7 +39,6 @@ impl SettlementStatus {
         matches!(
             (self, next),
             (Queued, Propagating)
-                | (Queued, Failed)
                 | (Propagating, Settled)
                 | (Propagating, Failed)
                 | (Propagating, Disputed)
@@ -85,6 +84,15 @@ impl SettlementTracker {
     /// Register a newly-queued envelope. Fresh entries always start `Queued`.
     pub fn track(&mut self, message_id: [u8; 32]) {
         self.statuses.insert(message_id, SettlementStatus::Queued);
+    }
+
+    /// Restore an envelope directly to `status`, bypassing transition
+    /// validation. Used when rehydrating the tracker from durable storage on
+    /// restart — the persisted status is ground truth and must be taken as-is
+    /// rather than re-derived through a (possibly impossible) chain of legal
+    /// transitions.
+    pub fn restore(&mut self, message_id: [u8; 32], status: SettlementStatus) {
+        self.statuses.insert(message_id, status);
     }
 
     pub fn status(&self, message_id: &[u8; 32]) -> Option<SettlementStatus> {

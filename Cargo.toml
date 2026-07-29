@@ -6,11 +6,36 @@ description = "Offline transaction queue, conflict resolution, and settlement tr
 license = "Apache-2.0"
 
 [lib]
-crate-type = ["rlib"]
+# `cdylib` and `staticlib` are needed alongside `rlib` so `src/ffi.rs`'s
+# `#[no_mangle] extern "C"` functions are actually exported as linkable
+# symbols for mobile consumers: `cdylib` produces the shared object Android/
+# JNI links against, `staticlib` produces the archive iOS links against, and
+# `rlib` keeps this crate usable as an ordinary Rust dependency (e.g. from
+# this crate's own `tests/`). Mirrors `stellarconduit-core`'s `[lib]` section,
+# which needs `cdylib` for the same reason (its own `src/ffi.rs`).
+crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
 # Shared mesh envelope types, signing, and relay-chain proofs
 stellarconduit-core = { git = "https://github.com/StellarConduit/stellarconduit-core.git", rev = "da4c057" }
+
+# Stellar transaction XDR parsing.
+#
+# We derive the true source account and sequence number from the already-built
+# transaction XDR rather than trusting caller-supplied values (see
+# `src/envelope/xdr.rs`). `stellar-xdr` at `22.1` is already in this crate's
+# dependency graph transitively, via `stellarconduit-core -> soroban-sdk`, so
+# depending on it directly adds no new crate versions to the build — important
+# for size-sensitive mobile wallets. Reaching through `soroban-sdk`'s `xdr`
+# re-export instead would have pulled the whole Soroban host API into our direct
+# surface for no benefit; `stellar-xdr` alone gives us exactly the transaction
+# envelope types we need. `default-features = false` with an explicit feature
+# set keeps the footprint to just the `curr` XDR types plus base64 decoding.
+stellar-xdr = { version = "22.1", default-features = false, features = [
+    "std",
+    "curr",
+    "base64",
+] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -47,8 +72,9 @@ env_logger = "0.11"
 tokio-test = "0.4"
 mockall = "0.12"
 rand = "0.8.5"
-criterion = { version = "0.5", features = ["async_tokio"] }
-tokio = { version = "1.37", features = ["full"] }
+tempfile = "3.27"
+
+
 clap = { version = "4.5", features = ["derive"] }
 
 # Property-based testing for conflict detection and the settlement state
@@ -58,21 +84,11 @@ clap = { version = "4.5", features = ["derive"] }
 # the QueuedSlot generators these tests need.
 proptest = "1.5"
 
+
 [[test]]
 name = "queue_storage_roundtrip_test"
 path = "tests/integration/queue_storage_roundtrip_test.rs"
 
-[[bench]]
-name = "queue_throughput"
-path = "benches/queue_throughput.rs"
-harness = false
-
-[[bench]]
-name = "storage_throughput"
-path = "benches/storage_throughput.rs"
-harness = false
-
-[[bench]]
-name = "conflict_detection"
-path = "benches/conflict_detection.rs"
-harness = false
+[[test]]
+name = "engine_restart_test"
+path = "tests/integration/engine_restart_test.rs"

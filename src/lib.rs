@@ -1,6 +1,8 @@
 pub mod conflict;
+pub mod engine;
 pub mod envelope;
 pub mod errors;
+pub mod ffi;
 pub mod metrics;
 pub mod queue;
 pub mod settlement;

@@ -126,6 +126,65 @@ impl SyncEngineDb {
         Ok(())
     }
 
+    /// Atomically persist a newly-signed payment in a single SQLite
+    /// transaction: its sequence reservation, the queued envelope, and its
+    /// initial `Queued` settlement status.
+    ///
+    /// All three rows share one transaction so that a crash at any instant
+    /// leaves the database either fully updated (the call completed) or
+    /// entirely unchanged (as if the call never happened) — never a
+    /// half-written state. This is what lets [`crate::engine::SyncEngine`] be
+    /// restart-safe: a Stellar sequence number cannot be skipped on-chain, so
+    /// writing the reservation without the envelope (or the envelope without
+    /// the reservation) would either burn a gap or invite a reuse, both of
+    /// which are double-spend hazards against the user's own account.
+    pub async fn enqueue_transaction(
+        &self,
+        envelope: &TransactionEnvelope,
+        source_account: &str,
+        sequence: i64,
+        priority: TxPriority,
+        enqueued_at: u64,
+    ) -> Result<(), SyncEngineError> {
+        let message_id = envelope.message_id.to_vec();
+        let envelope_bytes = rmp_serde::to_vec(envelope)?;
+        let source_account = source_account.to_string();
+        let priority: i64 = priority.into();
+        let status = SettlementStatus::Queued.as_str().to_string();
+
+        self.conn
+            .call(move |conn| {
+                let tx = conn.transaction()?;
+                tx.execute(
+                    "INSERT OR REPLACE INTO sequence_reservations
+                        (source_account, last_reserved) VALUES (?1, ?2)",
+                    rusqlite::params![source_account, sequence],
+                )?;
+                tx.execute(
+                    "INSERT OR REPLACE INTO queued_envelopes
+                        (message_id, source_account, sequence, priority, enqueued_at, envelope_bytes)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    rusqlite::params![
+                        message_id,
+                        source_account,
+                        sequence,
+                        priority,
+                        enqueued_at as i64,
+                        envelope_bytes
+                    ],
+                )?;
+                tx.execute(
+                    "INSERT OR REPLACE INTO settlement_status (message_id, status, updated_at)
+                     VALUES (?1, ?2, ?3)",
+                    rusqlite::params![message_id, status, enqueued_at as i64],
+                )?;
+                tx.commit()?;
+                Ok(())
+            })
+            .await?;
+        Ok(())
+    }
+
     pub async fn get_queued_envelope(
         &self,
         message_id: [u8; 32],
@@ -364,6 +423,31 @@ impl SyncEngineDb {
             })
             .await?;
         Ok(value)
+    }
+
+    /// Load every known account's last-reserved sequence number. Used by
+    /// [`crate::engine::SyncEngine::open`] to rehydrate all in-memory sequence
+    /// state in one pass after a restart; the per-account
+    /// [`Self::load_sequence_reservation`] is for single-account lookups.
+    pub async fn list_all_sequence_reservations(
+        &self,
+    ) -> Result<std::collections::HashMap<String, i64>, SyncEngineError> {
+        let rows = self
+            .conn
+            .call(|conn| {
+                let mut stmt = conn
+                    .prepare("SELECT source_account, last_reserved FROM sequence_reservations")?;
+                let rows = stmt
+                    .query_map([], |row| {
+                        let source_account: String = row.get(0)?;
+                        let last_reserved: i64 = row.get(1)?;
+                        Ok((source_account, last_reserved))
+                    })?
+                    .collect::<Result<std::collections::HashMap<_, _>, rusqlite::Error>>()?;
+                Ok(rows)
+            })
+            .await?;
+        Ok(rows)
     }
 
     pub async fn record_conflict(

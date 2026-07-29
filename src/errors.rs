@@ -44,6 +44,19 @@ pub enum SyncEngineError {
     #[error("envelope validation failed: {0}")]
     InvalidEnvelope(String),
 
+    #[error("failed to parse transaction XDR: {0}")]
+    XdrParse(String),
+
+    #[error("caller-claimed source account {claimed} does not match the source account {actual} encoded in the transaction XDR")]
+    SourceAccountMismatch { claimed: String, actual: String },
+
+    #[error("reserved sequence {reserved} does not match the sequence {actual} encoded in the transaction XDR for account {account}")]
+    SequenceMismatch {
+        account: String,
+        reserved: i64,
+        actual: i64,
+    },
+
     #[error("no queued envelope found for message_id {0}")]
     EnvelopeNotFound(String),
 
@@ -122,6 +135,9 @@ impl SyncEngineError {
     /// | `NoSequenceReserved` | Permanent | The caller never called `seed()`/`reserve()` before attempting to build an envelope. This is a programming error; retrying the same call without fixing the caller will always fail. |
     /// | `SequenceOutOfOrder` | Permanent | The caller passed a sequence number that regresses or equals `last_reserved`. This is a logical invariant violation in caller code; the sequence must be corrected before any retry makes sense. |
     /// | `InvalidEnvelope` | Permanent | Envelope validation failed because the payload itself is malformed. The same invalid bytes will fail validation on every attempt. |
+    /// | `XdrParse` | Permanent | The transaction XDR itself could not be parsed. The same bytes will fail to parse on every attempt; the caller must supply a well-formed transaction. |
+    /// | `SourceAccountMismatch` | Permanent | The caller-claimed source account doesn't match the one encoded in the transaction XDR. This is a caller bug (wrong account supplied); retrying with the same mismatched inputs will always fail. |
+    /// | `SequenceMismatch` | Permanent | The reserved sequence number doesn't match the one encoded in the transaction XDR. Retrying without correcting the sequence or the XDR will reproduce the same mismatch. |
     /// | `EnvelopeNotFound` | Permanent | A lookup by `message_id` returned nothing. The envelope was never enqueued, or has already been removed. Retrying the same lookup against the same DB will not materialise it. |
     /// | `InvalidStateTransition` | Permanent | A state-machine transition was attempted that is not in the legal transition graph. Retrying the same transition will never become legal; the caller has a logic bug. |
     /// | `UnresolvedConflict` | RequiresEscalation | Two envelopes compete for the same account/sequence slot and could not be resolved off-chain. Neither retrying nor giving up is correct — the dispute must be escalated to the on-chain `dispute-resolver` contract (see issue #002). |
@@ -139,6 +155,9 @@ impl SyncEngineError {
             SyncEngineError::NoSequenceReserved(_) => ErrorClass::Permanent,
             SyncEngineError::SequenceOutOfOrder { .. } => ErrorClass::Permanent,
             SyncEngineError::InvalidEnvelope(_) => ErrorClass::Permanent,
+            SyncEngineError::XdrParse(_) => ErrorClass::Permanent,
+            SyncEngineError::SourceAccountMismatch { .. } => ErrorClass::Permanent,
+            SyncEngineError::SequenceMismatch { .. } => ErrorClass::Permanent,
             SyncEngineError::EnvelopeNotFound(_) => ErrorClass::Permanent,
             SyncEngineError::InvalidStateTransition { .. } => ErrorClass::Permanent,
             SyncEngineError::UnknownMultisigSigner { .. } => ErrorClass::Permanent,
@@ -172,6 +191,16 @@ mod tests {
                 last_reserved: 10,
             },
             SyncEngineError::InvalidEnvelope("bad payload".into()),
+            SyncEngineError::XdrParse("bad xdr".into()),
+            SyncEngineError::SourceAccountMismatch {
+                claimed: "GCLAIMED".into(),
+                actual: "GACTUAL".into(),
+            },
+            SyncEngineError::SequenceMismatch {
+                account: "GTEST".into(),
+                reserved: 5,
+                actual: 6,
+            },
             SyncEngineError::EnvelopeNotFound("deadbeef".into()),
             SyncEngineError::InvalidStateTransition {
                 from: "queued".into(),
@@ -280,6 +309,31 @@ mod tests {
     fn test_invalid_envelope_is_permanent() {
         assert_eq!(
             SyncEngineError::InvalidEnvelope("malformed".into()).classify(),
+            ErrorClass::Permanent
+        );
+    }
+
+    #[test]
+    fn test_xdr_derivation_errors_are_permanent() {
+        assert_eq!(
+            SyncEngineError::XdrParse("bad xdr".into()).classify(),
+            ErrorClass::Permanent
+        );
+        assert_eq!(
+            SyncEngineError::SourceAccountMismatch {
+                claimed: "GCLAIMED".into(),
+                actual: "GACTUAL".into(),
+            }
+            .classify(),
+            ErrorClass::Permanent
+        );
+        assert_eq!(
+            SyncEngineError::SequenceMismatch {
+                account: "GTEST".into(),
+                reserved: 5,
+                actual: 6,
+            }
+            .classify(),
             ErrorClass::Permanent
         );
     }
