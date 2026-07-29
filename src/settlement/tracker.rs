@@ -192,6 +192,7 @@ mod tests {
         // logic. Any (from, to) pair not listed here is expected to be illegal.
         let allowed: &[(SettlementStatus, SettlementStatus)] = &[
             (Queued, Propagating),
+            (Queued, Failed),
             (Propagating, Settled),
             (Propagating, Failed),
             (Propagating, Disputed),

@@ -49,6 +49,14 @@ mockall = "0.12"
 rand = "0.8.5"
 criterion = { version = "0.5", features = ["async_tokio"] }
 tokio = { version = "1.37", features = ["full"] }
+clap = { version = "4.5", features = ["derive"] }
+
+# Property-based testing for conflict detection and the settlement state
+# machine. Chosen over quickcheck: proptest ships built-in shrinking (failures
+# reduce to a minimal reproducing case instead of a raw random seed) and a
+# richer combinator API (`prop::collection::vec`, `prop_oneof!`) for composing
+# the QueuedSlot generators these tests need.
+proptest = "1.5"
 
 [[test]]
 name = "queue_storage_roundtrip_test"
