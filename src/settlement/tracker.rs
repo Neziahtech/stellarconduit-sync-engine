@@ -39,6 +39,7 @@ impl SettlementStatus {
         matches!(
             (self, next),
             (Queued, Propagating)
+                | (Queued, Failed)
                 | (Propagating, Settled)
                 | (Propagating, Failed)
                 | (Propagating, Disputed)
