@@ -25,8 +25,8 @@
 //! machinery. See the `Cargo.toml` dependency note for details.
 
 use stellar_xdr::curr::{
-    FeeBumpTransactionInnerTx, Limits, MuxedAccount, PublicKey, ReadXdr, TransactionEnvelope,
-    Uint256,
+    FeeBumpTransactionInnerTx, Limits, MuxedAccount, PublicKey, ReadXdr, SequenceNumber,
+    TransactionEnvelope, Uint256, WriteXdr,
 };
 
 use crate::errors::SyncEngineError;
@@ -75,6 +75,33 @@ pub fn extract_source_account_and_sequence(tx_xdr: &str) -> Result<(String, i64)
     };
 
     Ok((account, sequence))
+}
+
+/// Parses an existing transaction envelope XDR, updates its sequence number to
+/// `new_sequence`, and returns the re-serialized XDR base64 string.
+///
+/// If the transaction is a fee-bump transaction, the inner transaction's sequence
+/// number is updated.
+pub fn with_updated_sequence(tx_xdr: &str, new_sequence: i64) -> Result<String, SyncEngineError> {
+    let mut envelope = TransactionEnvelope::from_xdr_base64(tx_xdr, Limits::none())
+        .map_err(|e| SyncEngineError::XdrParse(e.to_string()))?;
+
+    match &mut envelope {
+        TransactionEnvelope::Tx(env) => {
+            env.tx.seq_num = SequenceNumber(new_sequence);
+        }
+        TransactionEnvelope::TxFeeBump(env) => {
+            let FeeBumpTransactionInnerTx::Tx(inner) = &mut env.tx.inner_tx;
+            inner.tx.seq_num = SequenceNumber(new_sequence);
+        }
+        TransactionEnvelope::TxV0(env) => {
+            env.tx.seq_num = SequenceNumber(new_sequence);
+        }
+    }
+
+    envelope
+        .to_xdr_base64(Limits::none())
+        .map_err(|e| SyncEngineError::XdrParse(e.to_string()))
 }
 
 /// Reduce a (possibly muxed) source account to the `G...` StrKey of its base

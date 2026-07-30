@@ -23,7 +23,7 @@ use sha2::{Digest, Sha256};
 use stellarconduit_core::message::envelope::EnvelopeBuilder;
 use stellarconduit_core::message::types::TransactionEnvelope;
 
-use crate::envelope::xdr::extract_source_account_and_sequence;
+use crate::envelope::xdr::{extract_source_account_and_sequence, with_updated_sequence};
 use crate::errors::SyncEngineError;
 use crate::queue::{MultisigAccountRegistry, SequenceReservationManager};
 
@@ -89,6 +89,27 @@ impl OfflineEnvelopeBuilder {
             .build(signing_key);
         Ok((envelope, xdr_sequence))
     }
+}
+
+/// Parses the old envelope's `tx_xdr`, rewrites its sequence number, re-serializes it,
+/// and produces a freshly-signed `TransactionEnvelope` (with a new `message_id`) via
+/// the existing `EnvelopeBuilder` machinery.
+///
+/// Ensures that the other transaction semantics (operations, fee, memo if present)
+/// are preserved unchanged.
+pub fn resequence_and_resign(
+    old_envelope: &TransactionEnvelope,
+    new_sequence: i64,
+    signing_key: &SigningKey,
+) -> Result<TransactionEnvelope, SyncEngineError> {
+    let new_tx_xdr = with_updated_sequence(&old_envelope.tx_xdr, new_sequence)?;
+
+    let origin_pubkey = signing_key.verifying_key().to_bytes();
+    let envelope = EnvelopeBuilder::new(origin_pubkey, new_tx_xdr)
+        .ttl(old_envelope.ttl_hops)
+        .build(signing_key);
+
+    Ok(envelope)
 }
 
 /// ## Multi-signature source accounts
@@ -437,6 +458,59 @@ mod tests {
             10,
         );
         assert!(matches!(result, Err(SyncEngineError::XdrParse(_))));
+    }
+
+    #[test]
+    fn test_resequence_updates_embedded_sequence() {
+        let old_xdr = fixture("transaction_v1_envelope.b64");
+        let key = signing_key();
+        let old_env = EnvelopeBuilder::new(key.verifying_key().to_bytes(), old_xdr)
+            .ttl(10)
+            .build(&key);
+
+        let new_env = resequence_and_resign(&old_env, SEQ + 5, &key).unwrap();
+
+        let (_, new_seq) = extract_source_account_and_sequence(&new_env.tx_xdr).unwrap();
+        assert_eq!(new_seq, SEQ + 5);
+    }
+
+    #[test]
+    fn test_resequence_produces_new_message_id() {
+        let old_xdr = fixture("transaction_v1_envelope.b64");
+        let key = signing_key();
+        let old_env = EnvelopeBuilder::new(key.verifying_key().to_bytes(), old_xdr)
+            .ttl(10)
+            .build(&key);
+
+        let new_env = resequence_and_resign(&old_env, SEQ + 5, &key).unwrap();
+        assert_ne!(old_env.message_id, new_env.message_id);
+    }
+
+    #[test]
+    fn test_resequence_preserves_other_transaction_fields() {
+        let old_xdr = fixture("transaction_v1_envelope.b64");
+        let key = signing_key();
+        let old_env = EnvelopeBuilder::new(key.verifying_key().to_bytes(), old_xdr)
+            .ttl(10)
+            .build(&key);
+
+        let new_env = resequence_and_resign(&old_env, SEQ + 5, &key).unwrap();
+
+        let (old_account, _) = extract_source_account_and_sequence(&old_env.tx_xdr).unwrap();
+        let (new_account, _) = extract_source_account_and_sequence(&new_env.tx_xdr).unwrap();
+        assert_eq!(old_account, new_account);
+    }
+
+    #[test]
+    fn test_resequence_produces_validly_signed_envelope() {
+        let old_xdr = fixture("transaction_v1_envelope.b64");
+        let key = signing_key();
+        let old_env = EnvelopeBuilder::new(key.verifying_key().to_bytes(), old_xdr)
+            .ttl(10)
+            .build(&key);
+
+        let new_env = resequence_and_resign(&old_env, SEQ + 5, &key).unwrap();
+        assert!(validate_envelope(&new_env).is_ok());
     }
 }
 
