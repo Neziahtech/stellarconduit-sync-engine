@@ -366,8 +366,8 @@ impl SyncEngineDb {
     /// Update settlement statuses in bulk inside a single database transaction.
     /// Uses a Best-Effort policy: valid transitions are committed while illegal
     /// transitions (or untracked envelopes) are skipped and reported as `rejected`
-    /// in the returned `BatchUpdateReport`. 
-    /// This prevents a single stale message in a large relayed batch from 
+    /// in the returned `BatchUpdateReport`.
+    /// This prevents a single stale message in a large relayed batch from
     /// rejecting the entire batch and causing massive network re-transmission.
     pub async fn set_settlement_status_batch(
         &self,
@@ -384,7 +384,7 @@ impl SyncEngineDb {
 
                 for (message_id, to_status, updated_at) in updates {
                     let id = message_id.to_vec();
-                    
+
                     let from_status_res: rusqlite::Result<String> = tx
                         .query_row(
                             "SELECT status FROM settlement_status WHERE message_id = ?1",
@@ -880,55 +880,86 @@ mod tests {
     async fn test_batch_applies_all_valid_transitions() {
         let db = SyncEngineDb::init(":memory:").await.unwrap();
         // Insert initial queued status
-        db.set_settlement_status([1u8; 32], SettlementStatus::Queued, 1000).await.unwrap();
-        db.set_settlement_status([2u8; 32], SettlementStatus::Queued, 1000).await.unwrap();
+        db.set_settlement_status([1u8; 32], SettlementStatus::Queued, 1000)
+            .await
+            .unwrap();
+        db.set_settlement_status([2u8; 32], SettlementStatus::Queued, 1000)
+            .await
+            .unwrap();
 
-        let report = db.set_settlement_status_batch(&[
-            ([1u8; 32], SettlementStatus::Propagating, 1001),
-            ([2u8; 32], SettlementStatus::Failed, 1001),
-        ]).await.unwrap();
+        let report = db
+            .set_settlement_status_batch(&[
+                ([1u8; 32], SettlementStatus::Propagating, 1001),
+                ([2u8; 32], SettlementStatus::Failed, 1001),
+            ])
+            .await
+            .unwrap();
 
         assert_eq!(report.applied.len(), 2);
         assert_eq!(report.rejected.len(), 0);
-        
-        assert_eq!(db.get_settlement_status([1u8; 32]).await.unwrap(), Some(SettlementStatus::Propagating));
-        assert_eq!(db.get_settlement_status([2u8; 32]).await.unwrap(), Some(SettlementStatus::Failed));
+
+        assert_eq!(
+            db.get_settlement_status([1u8; 32]).await.unwrap(),
+            Some(SettlementStatus::Propagating)
+        );
+        assert_eq!(
+            db.get_settlement_status([2u8; 32]).await.unwrap(),
+            Some(SettlementStatus::Failed)
+        );
     }
 
     #[tokio::test]
     async fn test_batch_handles_mixed_valid_and_invalid_per_documented_policy() {
         let db = SyncEngineDb::init(":memory:").await.unwrap();
-        db.set_settlement_status([1u8; 32], SettlementStatus::Settled, 1000).await.unwrap();
-        db.set_settlement_status([2u8; 32], SettlementStatus::Queued, 1000).await.unwrap();
+        db.set_settlement_status([1u8; 32], SettlementStatus::Settled, 1000)
+            .await
+            .unwrap();
+        db.set_settlement_status([2u8; 32], SettlementStatus::Queued, 1000)
+            .await
+            .unwrap();
 
-        let report = db.set_settlement_status_batch(&[
-            // Invalid: Settled -> Propagating
-            ([1u8; 32], SettlementStatus::Propagating, 1001),
-            // Valid: Queued -> Propagating
-            ([2u8; 32], SettlementStatus::Propagating, 1001),
-            // Invalid: Untracked envelope
-            ([3u8; 32], SettlementStatus::Propagating, 1001),
-        ]).await.unwrap();
+        let report = db
+            .set_settlement_status_batch(&[
+                // Invalid: Settled -> Propagating
+                ([1u8; 32], SettlementStatus::Propagating, 1001),
+                // Valid: Queued -> Propagating
+                ([2u8; 32], SettlementStatus::Propagating, 1001),
+                // Invalid: Untracked envelope
+                ([3u8; 32], SettlementStatus::Propagating, 1001),
+            ])
+            .await
+            .unwrap();
 
         // Best effort: only valid ones are applied
         assert_eq!(report.applied, vec![[2u8; 32]]);
         assert_eq!(report.rejected.len(), 2);
-        
+
         // Status unchanged for invalid transition
-        assert_eq!(db.get_settlement_status([1u8; 32]).await.unwrap(), Some(SettlementStatus::Settled));
+        assert_eq!(
+            db.get_settlement_status([1u8; 32]).await.unwrap(),
+            Some(SettlementStatus::Settled)
+        );
         // Status changed for valid transition
-        assert_eq!(db.get_settlement_status([2u8; 32]).await.unwrap(), Some(SettlementStatus::Propagating));
+        assert_eq!(
+            db.get_settlement_status([2u8; 32]).await.unwrap(),
+            Some(SettlementStatus::Propagating)
+        );
     }
 
     #[tokio::test]
     async fn test_batch_report_accurately_reflects_outcomes() {
         let db = SyncEngineDb::init(":memory:").await.unwrap();
-        db.set_settlement_status([1u8; 32], SettlementStatus::Queued, 1000).await.unwrap();
+        db.set_settlement_status([1u8; 32], SettlementStatus::Queued, 1000)
+            .await
+            .unwrap();
 
-        let report = db.set_settlement_status_batch(&[
-            ([1u8; 32], SettlementStatus::Propagating, 1001),
-            ([9u8; 32], SettlementStatus::Propagating, 1001),
-        ]).await.unwrap();
+        let report = db
+            .set_settlement_status_batch(&[
+                ([1u8; 32], SettlementStatus::Propagating, 1001),
+                ([9u8; 32], SettlementStatus::Propagating, 1001),
+            ])
+            .await
+            .unwrap();
 
         assert_eq!(report.applied, vec![[1u8; 32]]);
         assert_eq!(report.rejected[0].0, [9u8; 32]);
@@ -939,11 +970,13 @@ mod tests {
     async fn test_batch_is_faster_than_sequential() {
         let db = SyncEngineDb::init(":memory:").await.unwrap();
         let count = 500;
-        
+
         for i in 0..count {
             let mut id = [0u8; 32];
             id[0..4].copy_from_slice(&(i as u32).to_be_bytes());
-            db.set_settlement_status(id, SettlementStatus::Queued, 1000).await.unwrap();
+            db.set_settlement_status(id, SettlementStatus::Queued, 1000)
+                .await
+                .unwrap();
         }
 
         let mut sequential_updates = Vec::new();
@@ -965,10 +998,17 @@ mod tests {
         let seq_duration = start_seq.elapsed();
 
         let start_batch = std::time::Instant::now();
-        db.set_settlement_status_batch(&batch_updates).await.unwrap();
+        db.set_settlement_status_batch(&batch_updates)
+            .await
+            .unwrap();
         let batch_duration = start_batch.elapsed();
 
-        assert!(batch_duration < seq_duration, "Batch: {:?}, Seq: {:?}", batch_duration, seq_duration);
+        assert!(
+            batch_duration < seq_duration,
+            "Batch: {:?}, Seq: {:?}",
+            batch_duration,
+            seq_duration
+        );
     }
 
     #[tokio::test]
