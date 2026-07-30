@@ -95,6 +95,12 @@ clap = { version = "4.5", features = ["derive"] }
 # the QueuedSlot generators these tests need.
 proptest = "1.5"
 
+# Benchmark harness for benches/*.rs (throughput of conflict detection, queue
+# push/pop, and storage operations). Declared here because the benches
+# themselves were added in a prior PR without this dependency, which left
+# `cargo clippy --all-targets` / `cargo test --workspace` unable to compile.
+criterion = "0.5"
+
 
 [[test]]
 name = "queue_storage_roundtrip_test"
@@ -103,3 +109,21 @@ path = "tests/integration/queue_storage_roundtrip_test.rs"
 [[test]]
 name = "engine_restart_test"
 path = "tests/integration/engine_restart_test.rs"
+
+# `harness = false` is required for every criterion bench: each file's
+# `criterion_main!` macro defines its own `fn main()`, which conflicts with
+# the default libtest harness cargo would otherwise inject.
+[[bench]]
+name = "conflict_detection"
+path = "benches/conflict_detection.rs"
+harness = false
+
+[[bench]]
+name = "queue_throughput"
+path = "benches/queue_throughput.rs"
+harness = false
+
+[[bench]]
+name = "storage_throughput"
+path = "benches/storage_throughput.rs"
+harness = false
