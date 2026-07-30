@@ -7,9 +7,10 @@ use std::path::Path;
 
 use tokio_rusqlite::Connection;
 
+use stellarconduit_core::message::relay_proof::RelayChainProof;
 use stellarconduit_core::message::types::TransactionEnvelope;
 
-use crate::conflict::Conflict;
+use crate::conflict::{Conflict, DisputeEscalation};
 use crate::errors::SyncEngineError;
 use crate::queue::TxPriority;
 use crate::settlement::SettlementStatus;
@@ -33,6 +34,20 @@ pub struct HistoryEntry {
     pub from_status: String,
     pub to_status: String,
     pub timestamp: u64,
+}
+
+/// A [`DisputeEscalation`] as durably stored, along with the row id used by
+/// [`SyncEngineDb::mark_escalation_submitted`] and the originating
+/// [`Conflict`]'s account/sequence/envelope bookkeeping.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PersistedEscalation {
+    pub id: i64,
+    pub source_account: String,
+    pub sequence: i64,
+    pub envelope_a: [u8; 32],
+    pub envelope_b: [u8; 32],
+    pub escalation: DisputeEscalation,
+    pub created_at: u64,
 }
 
 impl SyncEngineDb {
@@ -83,6 +98,20 @@ impl SyncEngineDb {
                     from_status TEXT NOT NULL,
                     to_status   TEXT NOT NULL,
                     timestamp   INTEGER NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS dispute_escalations (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source_account  TEXT NOT NULL,
+                    sequence        INTEGER NOT NULL,
+                    envelope_a      BLOB NOT NULL,
+                    envelope_b      BLOB NOT NULL,
+                    initiator       TEXT NOT NULL,
+                    respondent      TEXT NOT NULL,
+                    tx_id           BLOB NOT NULL,
+                    proof_bytes     BLOB NOT NULL,
+                    created_at      INTEGER NOT NULL,
+                    submitted       INTEGER NOT NULL DEFAULT 0
                 );",
             )?;
             Ok(())
@@ -506,6 +535,145 @@ impl SyncEngineDb {
             .collect())
     }
 
+    /// Durably persist `escalation` (built by
+    /// `crate::conflict::escalation::build_escalation` for `conflict`) and
+    /// set [`SettlementStatus::Disputed`] on both of `conflict`'s envelopes —
+    /// per the architecture, an escalated conflict's envelopes are neither
+    /// settled nor failed until on-chain arbitration resolves them.
+    ///
+    /// Returns the new row's id, which `mark_escalation_submitted` uses to
+    /// identify it later.
+    pub async fn save_escalation(
+        &self,
+        conflict: &Conflict,
+        escalation: &DisputeEscalation,
+        created_at: u64,
+    ) -> Result<i64, SyncEngineError> {
+        let source_account = conflict.source_account.clone();
+        let sequence = conflict.sequence;
+        let envelope_a = conflict.envelope_a.to_vec();
+        let envelope_b = conflict.envelope_b.to_vec();
+        let initiator = escalation.initiator.clone();
+        let respondent = escalation.respondent.clone();
+        let tx_id = escalation.tx_id.to_vec();
+        let proof_bytes = rmp_serde::to_vec(&escalation.proof)?;
+
+        let id = self
+            .conn
+            .call(move |conn| {
+                conn.execute(
+                    "INSERT INTO dispute_escalations
+                        (source_account, sequence, envelope_a, envelope_b, initiator, respondent, tx_id, proof_bytes, created_at, submitted)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0)",
+                    rusqlite::params![
+                        source_account,
+                        sequence,
+                        envelope_a,
+                        envelope_b,
+                        initiator,
+                        respondent,
+                        tx_id,
+                        proof_bytes,
+                        created_at as i64
+                    ],
+                )?;
+                Ok(conn.last_insert_rowid())
+            })
+            .await?;
+
+        self.set_settlement_status(conflict.envelope_a, SettlementStatus::Disputed, created_at)
+            .await?;
+        self.set_settlement_status(conflict.envelope_b, SettlementStatus::Disputed, created_at)
+            .await?;
+
+        Ok(id)
+    }
+
+    /// List every escalation not yet marked submitted (`submitted = 0`) —
+    /// i.e. still awaiting pickup by a relay node with live Soroban RPC
+    /// connectivity.
+    pub async fn list_pending_escalations(
+        &self,
+    ) -> Result<Vec<PersistedEscalation>, SyncEngineError> {
+        let rows = self
+            .conn
+            .call(|conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT id, source_account, sequence, envelope_a, envelope_b, initiator,
+                            respondent, tx_id, proof_bytes, created_at
+                     FROM dispute_escalations WHERE submitted = 0",
+                )?;
+                let rows = stmt
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, Vec<u8>>(3)?,
+                            row.get::<_, Vec<u8>>(4)?,
+                            row.get::<_, String>(5)?,
+                            row.get::<_, String>(6)?,
+                            row.get::<_, Vec<u8>>(7)?,
+                            row.get::<_, Vec<u8>>(8)?,
+                            row.get::<_, i64>(9)?,
+                        ))
+                    })?
+                    .collect::<Result<Vec<_>, rusqlite::Error>>()?;
+                Ok(rows)
+            })
+            .await?;
+
+        rows.into_iter()
+            .map(
+                |(
+                    id,
+                    source_account,
+                    sequence,
+                    envelope_a,
+                    envelope_b,
+                    initiator,
+                    respondent,
+                    tx_id,
+                    proof_bytes,
+                    created_at,
+                )| {
+                    let proof: RelayChainProof = rmp_serde::from_slice(&proof_bytes)?;
+                    Ok(PersistedEscalation {
+                        id,
+                        source_account,
+                        sequence,
+                        envelope_a: envelope_a.try_into().unwrap_or([0u8; 32]),
+                        envelope_b: envelope_b.try_into().unwrap_or([0u8; 32]),
+                        escalation: DisputeEscalation {
+                            initiator,
+                            respondent,
+                            tx_id: tx_id.try_into().unwrap_or([0u8; 32]),
+                            proof,
+                        },
+                        created_at: created_at as u64,
+                    })
+                },
+            )
+            .collect()
+    }
+
+    /// Mark the escalation with row id `id` as submitted, excluding it from
+    /// future [`list_pending_escalations`](Self::list_pending_escalations)
+    /// results. Called by a relay node once it has successfully submitted
+    /// the payload to `raise_dispute` on-chain.
+    pub async fn mark_escalation_submitted(&self, id: i64) -> Result<(), SyncEngineError> {
+        self.conn
+            .call(move |conn| {
+                conn.execute(
+                    "UPDATE dispute_escalations SET submitted = 1 WHERE id = ?1",
+                    rusqlite::params![id],
+                )?;
+                Ok(())
+            })
+            .await?;
+        Ok(())
+    }
+
     pub async fn sweep_stale_envelopes(
         &self,
         max_age_secs: u64,
@@ -791,5 +959,173 @@ mod tests {
 
         let second = db.sweep_stale_envelopes(500, 1000).await.unwrap();
         assert!(second.is_empty());
+    }
+
+    // ── Issue 2: dispute escalation tests ──
+
+    use crate::conflict::escalation::{build_escalation, EscalationInput};
+    use ed25519_dalek::SigningKey;
+    use rand::rngs::OsRng;
+    use tempfile::TempDir;
+
+    fn temp_db_path() -> (TempDir, String) {
+        let dir = TempDir::new().expect("create temp dir");
+        let path = dir.path().join("escalation-test.sqlite3");
+        (dir, path.to_string_lossy().into_owned())
+    }
+
+    fn escalation_input(
+        message_id: [u8; 32],
+        origin_pubkey: [u8; 32],
+        seen_at: u64,
+    ) -> EscalationInput {
+        let key = SigningKey::generate(&mut OsRng);
+        EscalationInput {
+            message_id,
+            origin_pubkey,
+            first_seen_locally_at: seen_at,
+            proof: RelayChainProof::sign(&key, &message_id, &[9u8; 32], 101),
+        }
+    }
+
+    fn sample_conflict() -> Conflict {
+        Conflict {
+            source_account: "GABC".to_string(),
+            sequence: 101,
+            envelope_a: [1u8; 32],
+            envelope_b: [2u8; 32],
+        }
+    }
+
+    #[tokio::test]
+    async fn test_escalation_persists_across_restart() {
+        let (_dir, path) = temp_db_path();
+        let conflict = sample_conflict();
+        let escalation = {
+            let db = SyncEngineDb::init(&path).await.unwrap();
+            let envelope_a = escalation_input(conflict.envelope_a, [10u8; 32], 1000);
+            let envelope_b = escalation_input(conflict.envelope_b, [20u8; 32], 2000);
+            let escalation = build_escalation(&conflict, &envelope_a, &envelope_b).unwrap();
+            db.save_escalation(&conflict, &escalation, 3000)
+                .await
+                .unwrap();
+            escalation
+            // `db` dropped here, closing the connection -- simulates a restart.
+        };
+
+        let reopened = SyncEngineDb::init(&path).await.unwrap();
+        let pending = reopened.list_pending_escalations().await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].source_account, conflict.source_account);
+        assert_eq!(pending[0].sequence, conflict.sequence);
+        assert_eq!(pending[0].envelope_a, conflict.envelope_a);
+        assert_eq!(pending[0].envelope_b, conflict.envelope_b);
+        assert_eq!(pending[0].escalation, escalation);
+
+        // Escalating both envelopes must have set them Disputed too.
+        assert_eq!(
+            reopened
+                .get_settlement_status(conflict.envelope_a)
+                .await
+                .unwrap(),
+            Some(SettlementStatus::Disputed)
+        );
+        assert_eq!(
+            reopened
+                .get_settlement_status(conflict.envelope_b)
+                .await
+                .unwrap(),
+            Some(SettlementStatus::Disputed)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mark_submitted_excludes_from_pending_list() {
+        let db = SyncEngineDb::init(":memory:").await.unwrap();
+        let conflict = sample_conflict();
+        let envelope_a = escalation_input(conflict.envelope_a, [10u8; 32], 1000);
+        let envelope_b = escalation_input(conflict.envelope_b, [20u8; 32], 2000);
+        let escalation = build_escalation(&conflict, &envelope_a, &envelope_b).unwrap();
+
+        let id = db
+            .save_escalation(&conflict, &escalation, 3000)
+            .await
+            .unwrap();
+
+        assert_eq!(db.list_pending_escalations().await.unwrap().len(), 1);
+
+        db.mark_escalation_submitted(id).await.unwrap();
+
+        assert!(db.list_pending_escalations().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_pending_escalations_excludes_only_submitted() {
+        let db = SyncEngineDb::init(":memory:").await.unwrap();
+
+        let conflict_1 = sample_conflict();
+        let envelope_a_1 = escalation_input(conflict_1.envelope_a, [10u8; 32], 1000);
+        let envelope_b_1 = escalation_input(conflict_1.envelope_b, [20u8; 32], 2000);
+        let escalation_1 = build_escalation(&conflict_1, &envelope_a_1, &envelope_b_1).unwrap();
+        let id_1 = db
+            .save_escalation(&conflict_1, &escalation_1, 3000)
+            .await
+            .unwrap();
+
+        let conflict_2 = Conflict {
+            source_account: "GXYZ".to_string(),
+            sequence: 202,
+            envelope_a: [3u8; 32],
+            envelope_b: [4u8; 32],
+        };
+        let envelope_a_2 = escalation_input(conflict_2.envelope_a, [30u8; 32], 1500);
+        let envelope_b_2 = escalation_input(conflict_2.envelope_b, [40u8; 32], 2500);
+        let escalation_2 = build_escalation(&conflict_2, &envelope_a_2, &envelope_b_2).unwrap();
+        db.save_escalation(&conflict_2, &escalation_2, 3500)
+            .await
+            .unwrap();
+
+        db.mark_escalation_submitted(id_1).await.unwrap();
+
+        let pending = db.list_pending_escalations().await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].source_account, "GXYZ");
+    }
+
+    #[tokio::test]
+    async fn test_escalation_survives_conflicting_concurrent_writes() {
+        // Two conflicting escalations for the same tx_id, written concurrently,
+        // must both land intact -- tokio_rusqlite serializes calls through a
+        // single connection actor, so this must never corrupt storage.
+        let db = std::sync::Arc::new(SyncEngineDb::init(":memory:").await.unwrap());
+
+        let conflict = sample_conflict();
+        let envelope_a = escalation_input(conflict.envelope_a, [10u8; 32], 1000);
+        let envelope_b = escalation_input(conflict.envelope_b, [20u8; 32], 2000);
+        let escalation_1 = build_escalation(&conflict, &envelope_a, &envelope_b).unwrap();
+        let escalation_2 = escalation_1.clone();
+
+        let conflict_1 = conflict.clone();
+        let conflict_2 = conflict.clone();
+        let db_1 = db.clone();
+        let db_2 = db.clone();
+
+        let (r1, r2) = tokio::join!(
+            tokio::spawn(
+                async move { db_1.save_escalation(&conflict_1, &escalation_1, 3000).await }
+            ),
+            tokio::spawn(
+                async move { db_2.save_escalation(&conflict_2, &escalation_2, 3001).await }
+            ),
+        );
+        r1.unwrap().unwrap();
+        r2.unwrap().unwrap();
+
+        let pending = db.list_pending_escalations().await.unwrap();
+        assert_eq!(
+            pending.len(),
+            2,
+            "both concurrent writes must be durably recorded, not corrupted"
+        );
     }
 }
