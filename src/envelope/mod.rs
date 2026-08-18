@@ -1,4 +1,5 @@
 pub mod builder;
+pub mod pq;
 pub mod xdr;
 
 pub use builder::{add_signature, try_promote, OfflineEnvelopeBuilder, PartiallySignedEnvelope};
