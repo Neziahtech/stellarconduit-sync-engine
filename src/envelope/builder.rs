@@ -55,9 +55,10 @@ impl OfflineEnvelopeBuilder {
         sequences: &mut SequenceReservationManager,
         source_account: &str,
         signing_key: &SigningKey,
+        policy: &crate::envelope::pq::SigningPolicy,
         tx_xdr: impl Into<String>,
         ttl_hops: u8,
-    ) -> Result<(TransactionEnvelope, i64), SyncEngineError> {
+    ) -> Result<(crate::envelope::pq::HybridSignedEnvelope, i64), SyncEngineError> {
         let tx_xdr = tx_xdr.into();
 
         // Trust the XDR, not the caller: the true source account and sequence
@@ -84,10 +85,25 @@ impl OfflineEnvelopeBuilder {
         }
 
         let origin_pubkey = signing_key.verifying_key().to_bytes();
-        let envelope = EnvelopeBuilder::new(origin_pubkey, tx_xdr)
+        let classical_envelope = EnvelopeBuilder::new(origin_pubkey, tx_xdr)
             .ttl(ttl_hops)
             .build(signing_key);
-        Ok((envelope, xdr_sequence))
+
+        let mut hybrid_envelope = crate::envelope::pq::HybridSignedEnvelope {
+            classical_envelope,
+            pq_signature: None,
+            pq_public_key: None,
+        };
+
+        if let crate::envelope::pq::SigningPolicy::Hybrid(pq_pk, pq_sk) = policy {
+            let payload = hybrid_envelope.canonical_payload();
+            let pq_sig = pqcrypto_dilithium::dilithium2::detached_sign(&payload, pq_sk);
+            use pqcrypto_traits::sign::{DetachedSignature, PublicKey};
+            hybrid_envelope.pq_signature = Some(pq_sig.as_bytes().to_vec());
+            hybrid_envelope.pq_public_key = Some(pq_pk.as_bytes().to_vec());
+        }
+
+        Ok((hybrid_envelope, xdr_sequence))
     }
 }
 
@@ -101,15 +117,30 @@ pub fn resequence_and_resign(
     old_envelope: &TransactionEnvelope,
     new_sequence: i64,
     signing_key: &SigningKey,
-) -> Result<TransactionEnvelope, SyncEngineError> {
+    policy: &crate::envelope::pq::SigningPolicy,
+) -> Result<crate::envelope::pq::HybridSignedEnvelope, SyncEngineError> {
     let new_tx_xdr = with_updated_sequence(&old_envelope.tx_xdr, new_sequence)?;
 
     let origin_pubkey = signing_key.verifying_key().to_bytes();
-    let envelope = EnvelopeBuilder::new(origin_pubkey, new_tx_xdr)
+    let classical_envelope = EnvelopeBuilder::new(origin_pubkey, new_tx_xdr)
         .ttl(old_envelope.ttl_hops)
         .build(signing_key);
 
-    Ok(envelope)
+    let mut hybrid_envelope = crate::envelope::pq::HybridSignedEnvelope {
+        classical_envelope,
+        pq_signature: None,
+        pq_public_key: None,
+    };
+
+    if let crate::envelope::pq::SigningPolicy::Hybrid(pq_pk, pq_sk) = policy {
+        let payload = hybrid_envelope.canonical_payload();
+        let pq_sig = pqcrypto_dilithium::dilithium2::detached_sign(&payload, pq_sk);
+        use pqcrypto_traits::sign::{DetachedSignature, PublicKey};
+        hybrid_envelope.pq_signature = Some(pq_sig.as_bytes().to_vec());
+        hybrid_envelope.pq_public_key = Some(pq_pk.as_bytes().to_vec());
+    }
+
+    Ok(hybrid_envelope)
 }
 
 /// ## Multi-signature source accounts
@@ -277,8 +308,9 @@ pub fn try_promote(
     partial: &PartiallySignedEnvelope,
     registry: &MultisigAccountRegistry,
     mesh_signing_key: &SigningKey,
+    policy: &crate::envelope::pq::SigningPolicy,
     ttl_hops: u8,
-) -> Result<TransactionEnvelope, SyncEngineError> {
+) -> Result<crate::envelope::pq::HybridSignedEnvelope, SyncEngineError> {
     if !partial.meets_threshold(registry) {
         return Err(SyncEngineError::MultisigThresholdNotMet {
             account: partial.source_account.clone(),
@@ -287,10 +319,25 @@ pub fn try_promote(
         });
     }
     let origin_pubkey = mesh_signing_key.verifying_key().to_bytes();
-    let envelope = EnvelopeBuilder::new(origin_pubkey, partial.tx_xdr.clone())
+    let classical_envelope = EnvelopeBuilder::new(origin_pubkey, partial.tx_xdr.clone())
         .ttl(ttl_hops)
         .build(mesh_signing_key);
-    Ok(envelope)
+
+    let mut hybrid_envelope = crate::envelope::pq::HybridSignedEnvelope {
+        classical_envelope,
+        pq_signature: None,
+        pq_public_key: None,
+    };
+
+    if let crate::envelope::pq::SigningPolicy::Hybrid(pq_pk, pq_sk) = policy {
+        let payload = hybrid_envelope.canonical_payload();
+        let pq_sig = pqcrypto_dilithium::dilithium2::detached_sign(&payload, pq_sk);
+        use pqcrypto_traits::sign::{DetachedSignature, PublicKey};
+        hybrid_envelope.pq_signature = Some(pq_sig.as_bytes().to_vec());
+        hybrid_envelope.pq_public_key = Some(pq_pk.as_bytes().to_vec());
+    }
+
+    Ok(hybrid_envelope)
 }
 
 #[cfg(test)]
@@ -324,10 +371,11 @@ mod tests {
         sequences.seed(SOURCE_G, SEQ - 1);
         let key = signing_key();
 
-        let (envelope, sequence) = OfflineEnvelopeBuilder::build_and_sign(
+        let (hybrid_env, sequence) = OfflineEnvelopeBuilder::build_and_sign(
             &mut sequences,
             SOURCE_G,
             &key,
+            &crate::envelope::pq::SigningPolicy::ClassicalOnly,
             fixture("transaction_v1_envelope.b64"),
             10,
         )
@@ -336,8 +384,11 @@ mod tests {
         // The returned sequence is the one embedded in the XDR, not merely the
         // next reservation.
         assert_eq!(sequence, SEQ);
-        assert!(validate_envelope(&envelope).is_ok());
-        assert_eq!(envelope.origin_pubkey, key.verifying_key().to_bytes());
+        assert!(validate_envelope(&hybrid_env.classical_envelope).is_ok());
+        assert_eq!(
+            hybrid_env.classical_envelope.origin_pubkey,
+            key.verifying_key().to_bytes()
+        );
     }
 
     #[test]
@@ -350,6 +401,7 @@ mod tests {
             &mut sequences,
             SOURCE_G,
             &key,
+            &crate::envelope::pq::SigningPolicy::ClassicalOnly,
             fixture("transaction_v1_envelope.b64"),
             10,
         )
@@ -358,6 +410,7 @@ mod tests {
             &mut sequences,
             SOURCE_G,
             &key,
+            &crate::envelope::pq::SigningPolicy::ClassicalOnly,
             fixture("transaction_v1_envelope_seq_next.b64"),
             10,
         )
@@ -376,6 +429,7 @@ mod tests {
             &mut sequences,
             SOURCE_G,
             &key,
+            &crate::envelope::pq::SigningPolicy::ClassicalOnly,
             fixture("transaction_v1_envelope.b64"),
             10,
         );
@@ -397,6 +451,7 @@ mod tests {
             &mut sequences,
             FEE_SOURCE_G,
             &key,
+            &crate::envelope::pq::SigningPolicy::ClassicalOnly,
             fixture("transaction_v1_envelope.b64"),
             10,
         );
@@ -424,6 +479,7 @@ mod tests {
             &mut sequences,
             SOURCE_G,
             &key,
+            &crate::envelope::pq::SigningPolicy::ClassicalOnly,
             fixture("transaction_v1_envelope.b64"),
             10,
         );
@@ -454,6 +510,7 @@ mod tests {
             &mut sequences,
             SOURCE_G,
             &key,
+            &crate::envelope::pq::SigningPolicy::ClassicalOnly,
             "not-valid-xdr !!!",
             10,
         );
@@ -468,9 +525,16 @@ mod tests {
             .ttl(10)
             .build(&key);
 
-        let new_env = resequence_and_resign(&old_env, SEQ + 5, &key).unwrap();
+        let new_env = resequence_and_resign(
+            &old_env,
+            SEQ + 5,
+            &key,
+            &crate::envelope::pq::SigningPolicy::ClassicalOnly,
+        )
+        .unwrap();
 
-        let (_, new_seq) = extract_source_account_and_sequence(&new_env.tx_xdr).unwrap();
+        let (_, new_seq) =
+            extract_source_account_and_sequence(&new_env.classical_envelope.tx_xdr).unwrap();
         assert_eq!(new_seq, SEQ + 5);
     }
 
@@ -482,8 +546,14 @@ mod tests {
             .ttl(10)
             .build(&key);
 
-        let new_env = resequence_and_resign(&old_env, SEQ + 5, &key).unwrap();
-        assert_ne!(old_env.message_id, new_env.message_id);
+        let new_env = resequence_and_resign(
+            &old_env,
+            SEQ + 5,
+            &key,
+            &crate::envelope::pq::SigningPolicy::ClassicalOnly,
+        )
+        .unwrap();
+        assert_ne!(old_env.message_id, new_env.classical_envelope.message_id);
     }
 
     #[test]
@@ -494,10 +564,17 @@ mod tests {
             .ttl(10)
             .build(&key);
 
-        let new_env = resequence_and_resign(&old_env, SEQ + 5, &key).unwrap();
+        let new_env = resequence_and_resign(
+            &old_env,
+            SEQ + 5,
+            &key,
+            &crate::envelope::pq::SigningPolicy::ClassicalOnly,
+        )
+        .unwrap();
 
         let (old_account, _) = extract_source_account_and_sequence(&old_env.tx_xdr).unwrap();
-        let (new_account, _) = extract_source_account_and_sequence(&new_env.tx_xdr).unwrap();
+        let (new_account, _) =
+            extract_source_account_and_sequence(&new_env.classical_envelope.tx_xdr).unwrap();
         assert_eq!(old_account, new_account);
     }
 
@@ -509,8 +586,14 @@ mod tests {
             .ttl(10)
             .build(&key);
 
-        let new_env = resequence_and_resign(&old_env, SEQ + 5, &key).unwrap();
-        assert!(validate_envelope(&new_env).is_ok());
+        let new_env = resequence_and_resign(
+            &old_env,
+            SEQ + 5,
+            &key,
+            &crate::envelope::pq::SigningPolicy::ClassicalOnly,
+        )
+        .unwrap();
+        assert!(validate_envelope(&new_env.classical_envelope).is_ok());
     }
 }
 
@@ -548,8 +631,14 @@ mod multisig_tests {
         assert!(!partial.meets_threshold(&registry));
 
         let mesh_key = signing_key();
-        let err = try_promote(&partial, &registry, &mesh_key, 10)
-            .expect_err("one of two required signatures must not be promotable");
+        let err = try_promote(
+            &partial,
+            &registry,
+            &mesh_key,
+            &crate::envelope::pq::SigningPolicy::ClassicalOnly,
+            10,
+        )
+        .expect_err("one of two required signatures must not be promotable");
         assert!(matches!(
             err,
             SyncEngineError::MultisigThresholdNotMet {
@@ -571,19 +660,31 @@ mod multisig_tests {
         assert!(partial.meets_threshold(&registry));
 
         let mesh_key = signing_key();
-        let envelope = try_promote(&partial, &registry, &mesh_key, 10)
-            .expect("threshold met, envelope should be promotable");
+        let hybrid_env = try_promote(
+            &partial,
+            &registry,
+            &mesh_key,
+            &crate::envelope::pq::SigningPolicy::ClassicalOnly,
+            10,
+        )
+        .expect("threshold met, envelope should be promotable");
 
-        assert!(validate_envelope(&envelope).is_ok());
-        assert_eq!(envelope.origin_pubkey, mesh_key.verifying_key().to_bytes());
-        assert_eq!(envelope.tx_xdr, "tx_xdr");
+        assert!(validate_envelope(&hybrid_env.classical_envelope).is_ok());
+        assert_eq!(
+            hybrid_env.classical_envelope.origin_pubkey,
+            mesh_key.verifying_key().to_bytes()
+        );
+        assert_eq!(hybrid_env.classical_envelope.tx_xdr, "tx_xdr");
 
         // A promoted envelope is a genuine TransactionEnvelope and is
         // therefore eligible for OutboundTxQueue — an envelope below
         // threshold has no way to produce one to push here at all.
         let mut queue = crate::queue::OutboundTxQueue::new();
         queue
-            .push(envelope, crate::queue::TxPriority::Emergency)
+            .push(
+                hybrid_env.classical_envelope,
+                crate::queue::TxPriority::Emergency,
+            )
             .unwrap();
         assert_eq!(queue.len(), 1);
     }

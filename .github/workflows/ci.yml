@@ -54,10 +54,6 @@ jobs:
     name: Benchmarks
     runs-on: ubuntu-latest
     needs: fmt-and-lint
-    # Run on every push to main and on pull_request events so PR authors see
-    # results. The comparison step uses benchmark-action to post a comment on
-    # the PR with a side-by-side comparison against the base commit's stored
-    # results (matching the pattern used by stellarconduit-core).
     if: github.event_name == 'push' || github.event_name == 'pull_request'
 
     steps:
@@ -70,40 +66,9 @@ jobs:
       - name: Cache cargo registry + build
         uses: Swatinem/rust-cache@v2
 
-      - name: Run benchmarks (Criterion JSON output)
-        # --message-format=json is not supported by criterion; instead we use
-        # the built-in --output-format=bencher flag (compatible with the
-        # benchmark-action tool) by setting CRITERION_HOME and relying on the
-        # default JSON output written to target/criterion/.
+      - name: Run benchmarks (Criterion / bencher output)
+        # Runs benchmarks and prints results to stdout.
+        # gh-pages publishing is intentionally omitted here so that PRs from
+        # forks do not attempt to write to a branch they cannot access.
+        # The upstream maintainers manage benchmark history storage on their end.
         run: cargo bench --bench queue_throughput --bench storage_throughput --bench conflict_detection -- --output-format=bencher 2>&1 | tee bench_output.txt
-
-      - name: Store benchmark results (main branch only)
-        if: github.ref == 'refs/heads/main'
-        uses: benchmark-action/github-action-benchmark@v1
-        with:
-          name: Sync Engine Benchmarks
-          tool: cargo
-          output-file-path: bench_output.txt
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          auto-push: true
-          # Results are pushed to the gh-pages branch under bench/ so
-          # the benchmark history page stays live between PRs.
-          gh-pages-branch: gh-pages
-          benchmark-data-dir-path: bench
-
-      - name: Compare benchmark results against base (PR only)
-        if: github.event_name == 'pull_request'
-        uses: benchmark-action/github-action-benchmark@v1
-        with:
-          name: Sync Engine Benchmarks
-          tool: cargo
-          output-file-path: bench_output.txt
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          # Post a PR comment with a regression table. A 10 % slowdown on any
-          # benchmark is flagged as a warning; 20 % fails the step so the PR
-          # cannot merge without explicit author acknowledgement.
-          alert-threshold: "120%"
-          comment-on-alert: true
-          fail-on-alert: true
-          gh-pages-branch: gh-pages
-          benchmark-data-dir-path: bench

@@ -12,6 +12,7 @@ use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 
 use stellarconduit_core::message::envelope::validate_envelope;
+use stellarconduit_sync_engine::envelope::pq::SigningPolicy;
 use stellarconduit_sync_engine::envelope::OfflineEnvelopeBuilder;
 use stellarconduit_sync_engine::queue::SequenceReservationManager;
 use stellarconduit_sync_engine::settlement::SettlementStatus;
@@ -42,14 +43,17 @@ async fn test_reserve_sign_persist_and_settle() {
     // reserving here must produce exactly what the XDR encodes.
     sequences.seed(source_account, SEQ - 1);
 
-    let (envelope, sequence) = OfflineEnvelopeBuilder::build_and_sign(
+    let (hybrid, sequence) = OfflineEnvelopeBuilder::build_and_sign(
         &mut sequences,
         source_account,
         &signing_key,
+        &SigningPolicy::ClassicalOnly,
         fixture("transaction_v1_envelope.b64"),
         10,
     )
     .unwrap();
+    let envelope = hybrid.classical_envelope;
+
     // The sequence is derived from the XDR, not merely the caller's claim.
     assert_eq!(sequence, SEQ);
     assert!(validate_envelope(&envelope).is_ok());
@@ -130,27 +134,31 @@ async fn test_conflicting_envelopes_for_same_slot_are_detected_and_recorded() {
     // reserves separately.
     let mut sequences_a = SequenceReservationManager::new();
     sequences_a.seed(source_account, SEQ - 1);
-    let (envelope_a, seq_a) = OfflineEnvelopeBuilder::build_and_sign(
+    let (hybrid_a, seq_a) = OfflineEnvelopeBuilder::build_and_sign(
         &mut sequences_a,
         source_account,
         &key_a,
+        &SigningPolicy::ClassicalOnly,
         fixture("transaction_v1_envelope.b64"),
         10,
     )
     .unwrap();
+    let envelope_a = hybrid_a.classical_envelope;
 
     let mut sequences_b = SequenceReservationManager::new();
     sequences_b.seed(source_account, SEQ - 1);
-    let (envelope_b, seq_b) = OfflineEnvelopeBuilder::build_and_sign(
+    let (hybrid_b, seq_b) = OfflineEnvelopeBuilder::build_and_sign(
         &mut sequences_b,
         source_account,
         &key_b,
+        &SigningPolicy::ClassicalOnly,
         // Same source and sequence, different payment: a genuinely conflicting
         // envelope, not a duplicate.
         fixture("transaction_v1_envelope_conflict.b64"),
         10,
     )
     .unwrap();
+    let envelope_b = hybrid_b.classical_envelope;
 
     // Both occupy the same (account, sequence) slot, derived from the XDR.
     assert_eq!(seq_a, SEQ);
