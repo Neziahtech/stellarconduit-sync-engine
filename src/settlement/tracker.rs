@@ -123,6 +123,15 @@ impl SettlementTracker {
         self.statuses.insert(message_id, next);
         Ok(())
     }
+
+    /// Get all tracked entries as a vector of (message_id, status) pairs.
+    /// Used by the invariant checker to iterate over all tracked states.
+    pub fn get_all_entries(&self) -> Vec<([u8; 32], SettlementStatus)> {
+        self.statuses
+            .iter()
+            .map(|(id, status)| (*id, *status))
+            .collect()
+    }
 }
 
 #[cfg(test)]
