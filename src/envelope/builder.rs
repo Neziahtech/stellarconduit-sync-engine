@@ -95,9 +95,8 @@ impl OfflineEnvelopeBuilder {
             pq_public_key: None,
         };
 
-        if let crate::envelope::pq::SigningPolicy::Hybrid(pq_sk) = policy {
+        if let crate::envelope::pq::SigningPolicy::Hybrid(pq_pk, pq_sk) = policy {
             let payload = hybrid_envelope.canonical_payload();
-            let pq_pk = pqcrypto_dilithium::dilithium2::public_key(pq_sk);
             let pq_sig = pqcrypto_dilithium::dilithium2::detached_sign(&payload, pq_sk);
             use pqcrypto_traits::sign::{DetachedSignature, PublicKey};
             hybrid_envelope.pq_signature = Some(pq_sig.as_bytes().to_vec());
@@ -133,9 +132,8 @@ pub fn resequence_and_resign(
         pq_public_key: None,
     };
 
-    if let crate::envelope::pq::SigningPolicy::Hybrid(pq_sk) = policy {
+    if let crate::envelope::pq::SigningPolicy::Hybrid(pq_pk, pq_sk) = policy {
         let payload = hybrid_envelope.canonical_payload();
-        let pq_pk = pqcrypto_dilithium::dilithium2::public_key(pq_sk);
         let pq_sig = pqcrypto_dilithium::dilithium2::detached_sign(&payload, pq_sk);
         use pqcrypto_traits::sign::{DetachedSignature, PublicKey};
         hybrid_envelope.pq_signature = Some(pq_sig.as_bytes().to_vec());
@@ -331,9 +329,8 @@ pub fn try_promote(
         pq_public_key: None,
     };
 
-    if let crate::envelope::pq::SigningPolicy::Hybrid(pq_sk) = policy {
+    if let crate::envelope::pq::SigningPolicy::Hybrid(pq_pk, pq_sk) = policy {
         let payload = hybrid_envelope.canonical_payload();
-        let pq_pk = pqcrypto_dilithium::dilithium2::public_key(pq_sk);
         let pq_sig = pqcrypto_dilithium::dilithium2::detached_sign(&payload, pq_sk);
         use pqcrypto_traits::sign::{DetachedSignature, PublicKey};
         hybrid_envelope.pq_signature = Some(pq_sig.as_bytes().to_vec());

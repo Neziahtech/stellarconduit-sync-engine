@@ -218,15 +218,17 @@ impl SyncEngine {
         }
 
         // Reserve the sequence and build + sign the envelope fully offline.
-        let (envelope, sequence) = OfflineEnvelopeBuilder::build_and_sign(
+        let (hybrid_env, sequence) = OfflineEnvelopeBuilder::build_and_sign(
             &mut self.sequences,
             source_account,
             signing_key,
+            &crate::envelope::pq::SigningPolicy::ClassicalOnly,
             tx_xdr,
             ttl_hops,
         )?;
 
         let enqueued_at = unix_now();
+        let envelope = hybrid_env.classical_envelope;
 
         // === Durable persistence, atomically, BEFORE any in-memory update. ===
         if let Err(err) = self

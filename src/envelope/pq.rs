@@ -1,6 +1,6 @@
 use crate::errors::SyncEngineError;
 use pqcrypto_dilithium::dilithium2;
-use pqcrypto_traits::sign::{DetachedSignature, PublicKey, SecretKey};
+use pqcrypto_traits::sign::{DetachedSignature, PublicKey};
 use serde::{Deserialize, Serialize};
 use stellarconduit_core::message::types::TransactionEnvelope;
 
@@ -9,7 +9,7 @@ pub enum SigningPolicy {
     /// Behavior is byte-for-byte unchanged from baseline.
     ClassicalOnly,
     /// Adds a post-quantum signature (ML-DSA-44 / Dilithium2) over the canonical payload.
-    Hybrid(dilithium2::SecretKey),
+    Hybrid(dilithium2::PublicKey, dilithium2::SecretKey),
 }
 
 /// A wrapper around the core `TransactionEnvelope` that can carry an optional PQ signature.
@@ -24,7 +24,7 @@ impl HybridSignedEnvelope {
     /// Canonical payload that both classical and PQ signatures are computed over.
     /// In this case, we just hash the XDR and the origin_pubkey as a stable representation.
     pub fn canonical_payload(&self) -> Vec<u8> {
-        let mut payload = self.classical_envelope.origin_pubkey.clone();
+        let mut payload = self.classical_envelope.origin_pubkey.to_vec();
         payload.extend_from_slice(self.classical_envelope.tx_xdr.as_bytes());
         payload
     }
@@ -97,7 +97,7 @@ mod tests {
         let key = signing_key();
 
         let pq_keypair = pqcrypto_dilithium::dilithium2::keypair();
-        let policy = SigningPolicy::Hybrid(pq_keypair.1);
+        let policy = SigningPolicy::Hybrid(pq_keypair.0, pq_keypair.1);
 
         let (hybrid_env, _) = OfflineEnvelopeBuilder::build_and_sign(
             &mut sequences,
@@ -124,7 +124,7 @@ mod tests {
         let key = signing_key();
 
         let pq_keypair = pqcrypto_dilithium::dilithium2::keypair();
-        let policy = SigningPolicy::Hybrid(pq_keypair.1);
+        let policy = SigningPolicy::Hybrid(pq_keypair.0, pq_keypair.1);
 
         let (mut hybrid_env, _) = OfflineEnvelopeBuilder::build_and_sign(
             &mut sequences,
@@ -155,7 +155,7 @@ mod tests {
         let key = signing_key();
 
         let pq_keypair = pqcrypto_dilithium::dilithium2::keypair();
-        let policy = SigningPolicy::Hybrid(pq_keypair.1);
+        let policy = SigningPolicy::Hybrid(pq_keypair.0, pq_keypair.1);
 
         let (hybrid_env, _) = OfflineEnvelopeBuilder::build_and_sign(
             &mut sequences,
