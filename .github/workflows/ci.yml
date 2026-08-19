@@ -78,7 +78,7 @@ jobs:
         run: cargo bench --bench queue_throughput --bench storage_throughput --bench conflict_detection -- --output-format=bencher 2>&1 | tee bench_output.txt
 
       - name: Store benchmark results (main branch only)
-        if: github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/main' && github.repository == 'StellarConduit/stellarconduit-sync-engine'
         uses: benchmark-action/github-action-benchmark@v1
         with:
           name: Sync Engine Benchmarks
@@ -92,7 +92,7 @@ jobs:
           benchmark-data-dir-path: bench
 
       - name: Compare benchmark results against base (PR only)
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' && github.repository == 'StellarConduit/stellarconduit-sync-engine'
         uses: benchmark-action/github-action-benchmark@v1
         with:
           name: Sync Engine Benchmarks
@@ -107,3 +107,5 @@ jobs:
           fail-on-alert: true
           gh-pages-branch: gh-pages
           benchmark-data-dir-path: bench
+          # Do not fail if gh-pages doesn't exist yet (first-time setup).
+          skip-fetch-gh-pages: true
