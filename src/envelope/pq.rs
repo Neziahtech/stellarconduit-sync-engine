@@ -1,8 +1,8 @@
+use crate::errors::SyncEngineError;
+use pqcrypto_dilithium::dilithium2;
+use pqcrypto_traits::sign::{DetachedSignature, PublicKey, SecretKey};
 use serde::{Deserialize, Serialize};
 use stellarconduit_core::message::types::TransactionEnvelope;
-use pqcrypto_dilithium::dilithium2;
-use pqcrypto_traits::sign::{SecretKey, PublicKey, DetachedSignature};
-use crate::errors::SyncEngineError;
 
 /// Opt-in signing policy for the envelope builder.
 pub enum SigningPolicy {
@@ -36,7 +36,7 @@ impl HybridSignedEnvelope {
                 .map_err(|_| SyncEngineError::PqVerificationFailed)?;
             let signature = dilithium2::DetachedSignature::from_bytes(sig_bytes)
                 .map_err(|_| SyncEngineError::PqVerificationFailed)?;
-            
+
             let payload = self.canonical_payload();
             dilithium2::verify_detached_signature(&signature, &payload, &public_key)
                 .map_err(|_| SyncEngineError::PqVerificationFailed)?;
@@ -48,11 +48,11 @@ impl HybridSignedEnvelope {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::envelope::builder::OfflineEnvelopeBuilder;
+    use crate::queue::SequenceReservationManager;
     use ed25519_dalek::SigningKey;
     use rand::rngs::OsRng;
     use stellarconduit_core::message::envelope::validate_envelope;
-    use crate::envelope::builder::OfflineEnvelopeBuilder;
-    use crate::queue::SequenceReservationManager;
 
     const SOURCE_G: &str = "GAIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCF6M";
     const SEQ: i64 = 103_720_918_407_610_369;
@@ -82,7 +82,8 @@ mod tests {
             &SigningPolicy::ClassicalOnly,
             fixture("transaction_v1_envelope.b64"),
             10,
-        ).unwrap();
+        )
+        .unwrap();
 
         assert!(hybrid_env.pq_signature.is_none());
         assert!(hybrid_env.pq_public_key.is_none());
@@ -94,7 +95,7 @@ mod tests {
         let mut sequences = SequenceReservationManager::new();
         sequences.seed(SOURCE_G, SEQ - 1);
         let key = signing_key();
-        
+
         let pq_keypair = pqcrypto_dilithium::dilithium2::keypair();
         let policy = SigningPolicy::Hybrid(pq_keypair.1);
 
@@ -105,11 +106,12 @@ mod tests {
             &policy,
             fixture("transaction_v1_envelope.b64"),
             10,
-        ).unwrap();
+        )
+        .unwrap();
 
         assert!(hybrid_env.pq_signature.is_some());
         assert!(hybrid_env.pq_public_key.is_some());
-        
+
         // Both classical and PQ signatures must be valid
         assert!(validate_envelope(&hybrid_env.classical_envelope).is_ok());
         assert!(hybrid_env.verify_pq().is_ok());
@@ -120,7 +122,7 @@ mod tests {
         let mut sequences = SequenceReservationManager::new();
         sequences.seed(SOURCE_G, SEQ - 1);
         let key = signing_key();
-        
+
         let pq_keypair = pqcrypto_dilithium::dilithium2::keypair();
         let policy = SigningPolicy::Hybrid(pq_keypair.1);
 
@@ -131,7 +133,8 @@ mod tests {
             &policy,
             fixture("transaction_v1_envelope.b64"),
             10,
-        ).unwrap();
+        )
+        .unwrap();
 
         assert!(hybrid_env.verify_pq().is_ok());
 
@@ -139,7 +142,10 @@ mod tests {
         if let Some(ref mut sig) = hybrid_env.pq_signature {
             sig[0] ^= 0xff;
         }
-        assert!(matches!(hybrid_env.verify_pq(), Err(SyncEngineError::PqVerificationFailed)));
+        assert!(matches!(
+            hybrid_env.verify_pq(),
+            Err(SyncEngineError::PqVerificationFailed)
+        ));
     }
 
     #[test]
@@ -147,7 +153,7 @@ mod tests {
         let mut sequences = SequenceReservationManager::new();
         sequences.seed(SOURCE_G, SEQ - 1);
         let key = signing_key();
-        
+
         let pq_keypair = pqcrypto_dilithium::dilithium2::keypair();
         let policy = SigningPolicy::Hybrid(pq_keypair.1);
 
@@ -158,13 +164,22 @@ mod tests {
             &policy,
             fixture("transaction_v1_envelope.b64"),
             10,
-        ).unwrap();
+        )
+        .unwrap();
 
-        let sig_size = hybrid_env.pq_signature.as_ref().map(|s| s.len()).unwrap_or(0);
-        
+        let sig_size = hybrid_env
+            .pq_signature
+            .as_ref()
+            .map(|s| s.len())
+            .unwrap_or(0);
+
         // ML-DSA-44 (Dilithium2) signatures should be ~2420 bytes.
-        // We assert it's less than 2500 to allow for minimal overhead, 
+        // We assert it's less than 2500 to allow for minimal overhead,
         // ensuring it doesn't accidentally bloat (e.g. SPHINCS+).
-        assert!(sig_size > 0 && sig_size < 2500, "PQ Signature size out of expected ML-DSA-44 bounds: {}", sig_size);
+        assert!(
+            sig_size > 0 && sig_size < 2500,
+            "PQ Signature size out of expected ML-DSA-44 bounds: {}",
+            sig_size
+        );
     }
 }
