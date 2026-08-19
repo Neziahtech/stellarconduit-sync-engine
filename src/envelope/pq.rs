@@ -9,7 +9,7 @@ pub enum SigningPolicy {
     /// Behavior is byte-for-byte unchanged from baseline.
     ClassicalOnly,
     /// Adds a post-quantum signature (ML-DSA-44 / Dilithium2) over the canonical payload.
-    Hybrid(dilithium2::PublicKey, dilithium2::SecretKey),
+    Hybrid(Box<dilithium2::PublicKey>, Box<dilithium2::SecretKey>),
 }
 
 /// A wrapper around the core `TransactionEnvelope` that can carry an optional PQ signature.
@@ -97,7 +97,7 @@ mod tests {
         let key = signing_key();
 
         let pq_keypair = pqcrypto_dilithium::dilithium2::keypair();
-        let policy = SigningPolicy::Hybrid(pq_keypair.0, pq_keypair.1);
+        let policy = SigningPolicy::Hybrid(Box::new(pq_keypair.0), Box::new(pq_keypair.1));
 
         let (hybrid_env, _) = OfflineEnvelopeBuilder::build_and_sign(
             &mut sequences,
@@ -124,7 +124,7 @@ mod tests {
         let key = signing_key();
 
         let pq_keypair = pqcrypto_dilithium::dilithium2::keypair();
-        let policy = SigningPolicy::Hybrid(pq_keypair.0, pq_keypair.1);
+        let policy = SigningPolicy::Hybrid(Box::new(pq_keypair.0), Box::new(pq_keypair.1));
 
         let (mut hybrid_env, _) = OfflineEnvelopeBuilder::build_and_sign(
             &mut sequences,
@@ -155,7 +155,7 @@ mod tests {
         let key = signing_key();
 
         let pq_keypair = pqcrypto_dilithium::dilithium2::keypair();
-        let policy = SigningPolicy::Hybrid(pq_keypair.0, pq_keypair.1);
+        let policy = SigningPolicy::Hybrid(Box::new(pq_keypair.0), Box::new(pq_keypair.1));
 
         let (hybrid_env, _) = OfflineEnvelopeBuilder::build_and_sign(
             &mut sequences,
