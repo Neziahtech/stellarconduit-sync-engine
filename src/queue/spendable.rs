@@ -73,12 +73,7 @@ mod tests {
     use super::*;
     use stellarconduit_core::message::types::TransactionEnvelope;
 
-    fn spend(
-        account: &str,
-        id: u8,
-        amount: i64,
-        status: SettlementStatus,
-    ) -> QueuedEnvelopeSpend {
+    fn spend(account: &str, id: u8, amount: i64, status: SettlementStatus) -> QueuedEnvelopeSpend {
         QueuedEnvelopeSpend::new(
             QueuedEnvelopeRecord {
                 envelope: TransactionEnvelope {
@@ -98,7 +93,6 @@ mod tests {
             status,
         )
     }
-
     use crate::queue::TxPriority;
 
     #[test]
